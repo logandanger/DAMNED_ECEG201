@@ -38,6 +38,15 @@ This README is the single reference for the circuit. Everything below was extrac
 | `docs/DA2-PCB-Layout-in-KiCad.pdf` | Course assignment 2 (KiCad layout). |
 | `docs/DA8-DAMNED-Assembly.pdf` | Course assignment 8 (assembly and CircuitPython test). |
 | `docs/DAMNED-sensors-2026-11.pdf` | Course-approved Adafruit parts list. |
+| `docs/controls.md` | Control mapping and proposal. |
+| `docs/architecture.md` | Software structure, real-time rules, CPU and RAM budgets. |
+| `docs/mirror-protocol.md` | Framebuffer protocol for `--mirror`. |
+| `core/` | Synth engine, UI, app logic, mirror protocol. No hardware access. |
+| `core/config/control_map.hpp` | Every control-to-function mapping. |
+| `hal/` | `hal.hpp` interface; `esp32/` and `sim/` implementations. |
+| `firmware/` | ESP-IDF entry point, tasks, mirror sender, PlatformIO project. |
+| `sim/` | SDL2 simulator. |
+| `tests/` | Unit tests, whole-app tests, benchmark. |
 
 Assembly guide (not mirrored): <https://bucknellmakers.dozuki.com/Guide/DAMNED+Project+Assembly/144?lang=en>
 
@@ -318,6 +327,7 @@ The board itself has **no audio hardware**. It exposes the I2S signals on **J3**
 | R7 | Keys are on/off only | No velocity. | Deferred. Later: two-contact keys and a second AW9523 (24 inputs), velocity from the time between contacts. |
 | R8 | Encoder/DAC addresses and Adafruit product IDs | Marked **[verify]** above. | Check on arrival with an I2C scan. |
 | R9 | The filename says "no LDO" but U3 (TLV75733) is on the netlist | Unclear which course variant this is. | Confirm what is actually populated on your board. |
+| R10 | AW9523 has no internal pull-ups | The 12 keys read as floating inputs without them. | Fit an external pull-up, about 10 k to 3V3, on each key line. Firmware assumes active-low. |
 
 ## 16. Planned software architecture
 
@@ -333,7 +343,35 @@ The board itself has **no audio hardware**. It exposes the I2S signals on **J3**
 - **Buttons:** read the six debounced GPIOs as active-low; no software debounce.
 - **Course firmware:** the DAMNED course software is CircuitPython (libraries: `adafruit_st7789`, `adafruit_dotstar`, `cp_mcp3x21`, `button_handler`, `adafruit_display_text`). It is useful for quick bring-up tests of the same pins. The production OS here is C++.
 
-Status: repo created, hardware documented, no firmware or simulator code yet.
+Status: synth engine, UI and simulator run on the PC. Firmware compiles for the ESP32-S3 but has not run on hardware, and the DAC driver is not written. See `docs/architecture.md`.
+
+### Run the simulator
+
+Needs only Python. The script fetches a private, pinned compiler, CMake and Ninja, builds, and runs the tests. Its files go to `~/.danger-build`, outside OneDrive.
+
+```
+python tools/build_sim.py
+build/danger_sim
+```
+
+| Flag | Mode |
+|---|---|
+| (none) | Full replica with audio |
+| `--screen-only` | Only the 320x240 UI; add `--scale 2` to enlarge |
+| `--mirror COM5` | Live screen of the real device over USB |
+| `--help` | Lists all flags |
+
+Controls: `docs/controls.md`. Esc quits.
+
+### Build the firmware
+
+```
+cd firmware
+pio run -e danger              # with screen mirror
+pio run -e danger-nomirror     # without
+```
+
+Needs `pip install platformio`. Pinned to `espressif32@8.0.0`, which brings ESP-IDF 6.1. Set `PLATFORMIO_WORKSPACE_DIR` to a folder outside OneDrive, or the build tree gets synced.
 
 ## 17. Bill of materials
 

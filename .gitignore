@@ -1,0 +1,10 @@
+build/
+.toolchain/
+.pio/
+firmware/.pio/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/sdkconfig
+firmware/sdkconfig.*
+!firmware/sdkconfig.defaults
+.vscode/
