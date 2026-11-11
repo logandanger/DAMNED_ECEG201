@@ -14,7 +14,8 @@ void set(uint8_t* rgb, int i, int r, int g, int b, float brightness) {
 
 }  // namespace
 
-void led_view_render(uint8_t* rgb, float peak, uint8_t voice_mask, uint16_t key_mask, float brightness) {
+void led_view_render(uint8_t* rgb, float peak, uint8_t layer_mask, uint16_t key_mask) {
+    const float brightness = kLedBrightness;
     std::memset(rgb, 0, kLedCount * 3);
     // Level over a 48 dB span, one cell per 3 dB.
     const float db = peak > 1e-5f ? 20.0f * std::log10(peak) : -100.0f;
@@ -24,7 +25,7 @@ void led_view_render(uint8_t* rgb, float peak, uint8_t voice_mask, uint16_t key_
         else set(rgb, i, 255, 255, 255, brightness);
     }
     for (int i = 0; i < 4; ++i) {
-        if (voice_mask & (1u << i)) set(rgb, kLedColumns + i, 255, 0, 15, brightness);
+        if (layer_mask & (1u << i)) set(rgb, kLedColumns + i, 255, 0, 15, brightness);
     }
     for (int i = 0; i < 12; ++i) {
         if (key_mask & (1u << i)) set(rgb, kLedColumns + 4 + i, 255, 255, 255, brightness);

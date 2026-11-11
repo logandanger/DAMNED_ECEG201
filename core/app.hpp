@@ -1,42 +1,38 @@
-// Application root. Owns the parameters, engine and menu and connects them to hal/.
-//   on_control()  input task
-//   ui_tick()     UI task
-//   Engine        audio task, through Engine::audio_callback
+// Application root. Connects hal/ input, the beat engine and the view.
+//   on_control()  input task: keys go straight to the audio task, the rest to the UI task
+//   ui_tick()     UI task: A/B logic, encoders, view, LEDs
+//   BeatEngine    audio task, through BeatEngine::audio_callback
 #pragma once
 #include <atomic>
 
-#include "core/synth/engine.hpp"
-#include "core/ui/mapper.hpp"
-#include "core/ui/menu.hpp"
+#include "core/beat/engine.hpp"
+#include "core/ui/buttons.hpp"
 #include "core/util/spsc.hpp"
 
 namespace danger {
 
 class App {
 public:
-    App() : menu_(&params_) {}
-
-    void init();         // engine, first preset, LVGL
+    void init();  // engine, LVGL
     void start_audio();
     void on_control(const hal::ControlEvent& e);
     void ui_tick();
 
     static void control_sink(const hal::ControlEvent& e, void* user) { static_cast<App*>(user)->on_control(e); }
 
-    Engine& engine() { return engine_; }
-    ParamStore& params() { return params_; }
-    const Menu& menu() const { return menu_; }
+    BeatEngine& engine() { return engine_; }
+    int browse() const { return browse_; }
+    const ButtonLogic& buttons() const { return buttons_; }
 
 private:
-    void on_key(const hal::ControlEvent& e);
+    void handle(const hal::ControlEvent& e, uint32_t now);
+    void act(ButtonAction a);
 
-    ParamStore params_;
-    Engine engine_;
-    Menu menu_;
-    ControlMapper mapper_;
-    Spsc<MappedAction, 64> actions_;
-    uint8_t key_note_[hal::kKeyCount] = {};  // a release must match its press across octave shifts
+    BeatEngine engine_;
+    ButtonLogic buttons_;
+    Spsc<hal::ControlEvent, 64> events_;
     std::atomic<uint16_t> key_mask_{0};
+    int browse_ = 0;  // instrument under the cursor; becomes current on Select
     uint32_t last_view_ms_ = 0;
 };
 

@@ -1,5 +1,7 @@
 #include "sim/replica.hpp"
 
+#include "core/config/control_map.hpp"
+
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -39,7 +41,8 @@ const Uint8* glyph(char c) {
         {0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43}};
     static const Uint8 space[5] = {0, 0, 0, 0, 0}, semi[5] = {0x00,0x56,0x36,0x00,0x00},
                        comma[5] = {0x00,0x50,0x30,0x00,0x00}, dot[5] = {0x00,0x60,0x60,0x00,0x00},
-                       slash[5] = {0x20,0x10,0x08,0x04,0x02}, dash[5] = {0x08,0x08,0x08,0x08,0x08};
+                       slash[5] = {0x20,0x10,0x08,0x04,0x02}, dash[5] = {0x08,0x08,0x08,0x08,0x08},
+                       plus[5] = {0x08,0x08,0x3E,0x08,0x08};
     if (c >= '0' && c <= '9') return digits[c - '0'];
     if (c >= 'A' && c <= 'Z') return letters[c - 'A'];
     switch (c) {
@@ -48,6 +51,7 @@ const Uint8* glyph(char c) {
         case '.': return dot;
         case '/': return slash;
         case '-': return dash;
+        case '+': return plus;
         default: return space;
     }
 }
@@ -88,19 +92,19 @@ constexpr SDL_Rect kSpeaker = {1060, 40, 110, 230};
 constexpr int kKeysY = 626, kKeysH = 250, kKeysX = 24, kKeysW = 1152;
 constexpr int kBlackH = 130, kBlackW = 100;
 
-struct Button { Control control; SDL_Rect rect; const char* label; };
+struct Button { Control control; SDL_Rect rect; const char* label; const char* role; };
 const Button kButtons[] = {
-    {Control::Up,    {98, 196, 76, 60},  "UP"},
-    {Control::Down,  {98, 324, 76, 60},  "DOWN"},
-    {Control::Left,  {24, 260, 76, 60},  "LEFT"},
-    {Control::Right, {172, 260, 76, 60}, "RIGHT"},
-    {Control::A,     {980, 214, 76, 56}, "A"},
-    {Control::B,     {916, 300, 76, 56}, "B"},
+    {Control::Up,    {98, 196, 76, 60},  "UP", ""},
+    {Control::Down,  {98, 324, 76, 60},  "DOWN", ""},
+    {Control::Left,  {24, 260, 76, 60},  "LEFT", ""},
+    {Control::Right, {172, 260, 76, 60}, "RIGHT", ""},
+    {Control::A,     {980, 214, 76, 56}, "A", "NEXT/HOLD"},
+    {Control::B,     {916, 300, 76, 56}, "B", "PREV"},
 };
 
 struct Encoder { Control control; int x, y; const char* label; };
 constexpr int kEncRadius = 44;
-const Encoder kEncoders[] = {{Control::Enc1, 1115, 346, "ENC 1"}, {Control::Enc2, 1115, 490, "ENC 2"}};
+const Encoder kEncoders[] = {{Control::Enc1, 1115, 346, "REVERB"}, {Control::Enc2, 1115, 490, "BPM"}};
 
 struct KeyShape { SDL_Rect rect; bool black; const char* hint; };
 KeyShape key_shape(int key) {
@@ -269,7 +273,11 @@ void Replica::draw(SDL_Renderer* r, SDL_Texture* screen, const uint8_t* leds) {
         fill(r, b.rect, held ? kInk : kPaper);
         frame(r, b.rect, latched_[int(b.control)] ? kSignal : kInk);
         text_centered(r, b.rect, b.label, 2, held ? kPaper : kInk);
+        const SDL_Rect role = {b.rect.x - 40, b.rect.y + b.rect.h + 6, b.rect.w + 80, 14};
+        text_centered(r, role, b.role, 2, kGrey);
     }
+    text(r, 24, 420, "A+B 1 S  CLEAR LAYER", 2, kGrey);
+    text(r, 24, 442, "A+B 3 S  CLEAR ALL", 2, kGrey);
 
     for (int i = 0; i < 2; ++i) {
         const Encoder& e = kEncoders[i];
@@ -292,6 +300,11 @@ void Replica::draw(SDL_Renderer* r, SDL_Texture* screen, const uint8_t* leds) {
             frame(r, s.rect, kInk);
             const SDL_Rect hint = {s.rect.x, s.rect.y + s.rect.h - 30, s.rect.w, 20};
             text_centered(r, hint, s.hint, 2, (s.black || held) ? kPaper : kGrey);
+            if (danger::kKeyDrum[k] >= 0) {  // drum pad
+                static const char* const kPad[] = {"KICK", "SNARE", "HAT", "CRASH"};
+                const SDL_Rect name = {s.rect.x, s.rect.y + 16, s.rect.w, 20};
+                text_centered(r, name, kPad[danger::kKeyDrum[k]], 2, kPaper);
+            }
         }
     }
 

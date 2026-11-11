@@ -1,13 +1,13 @@
 # DAMNED_ECEG201
 
-Interactive OS and desktop simulator for the DANGER synth, prototype #1. The hardware is the Bucknell ECEG 201 DAMNED board (ESP32-S3) plus Adafruit I2C breakouts.
+Interactive OS and desktop simulator for DANGER, prototype #1: a generative beat maker built on preloaded samples. The hardware is the Bucknell ECEG 201 DAMNED board (ESP32-S3) plus Adafruit I2C breakouts.
 
 This README is the single reference for the circuit. Everything below was extracted from the KiCad files in `hardware/kicad/` (the netlist is generated from the `.kicad_pcb`, so it reflects the routed board). Items marked **[verify]** were not provable from the files and need a check on the physical board or datasheet.
 
 ## Contents
 
 1. [Repo layout](#1-repo-layout)
-2. [Prototype #1 concept](#2-prototype-1-concept)
+2. [Prototype #1 concept](#2-prototype-1-concept), [behavior](#beat-maker-behavior), [control map](#control-map)
 3. [System block diagram](#3-system-block-diagram)
 4. [Power](#4-power)
 5. [ESP32-S3 module and pin map](#5-esp32-s3-module-and-pin-map)
@@ -19,7 +19,7 @@ This README is the single reference for the circuit. Everything below was extrac
 11. [USB-C](#11-usb-c)
 12. [CAN bus](#12-can-bus)
 13. [Connectors, headers, jumpers, test points](#13-connectors-headers-jumpers-and-test-points)
-14. [Free resources for the synth](#14-free-resources-for-the-synth)
+14. [Free resources](#14-free-resources)
 15. [Risks and open issues](#15-risks-and-open-issues)
 16. [Planned software architecture](#16-planned-software-architecture)
 17. [Bill of materials](#17-bill-of-materials)
@@ -38,10 +38,14 @@ This README is the single reference for the circuit. Everything below was extrac
 | `docs/DA2-PCB-Layout-in-KiCad.pdf` | Course assignment 2 (KiCad layout). |
 | `docs/DA8-DAMNED-Assembly.pdf` | Course assignment 8 (assembly and CircuitPython test). |
 | `docs/DAMNED-sensors-2026-11.pdf` | Course-approved Adafruit parts list. |
-| `docs/controls.md` | Control mapping and proposal. |
+| `docs/controls.md` | Control mapping, A/B chord logic, conflicts. |
 | `docs/architecture.md` | Software structure, real-time rules, CPU and RAM budgets. |
 | `docs/mirror-protocol.md` | Framebuffer protocol for `--mirror`. |
-| `core/` | Synth engine, UI, app logic, mirror protocol. No hardware access. |
+| `core/` | Beat engine, sampler, reverb, UI, app logic, mirror protocol. No hardware access. |
+| `core/config/beat_config.hpp` | Every tunable: commit time, fades, loop, grid, layers, mutation, drums, hold times. |
+| `core/samples/sample_data.cpp` | Generated sample data (flash). Do not edit; run `tools/pack_samples.py`. |
+| `samples/` | Source WAVs and `manifest.csv`. |
+| `tools/` | `build_sim.py`, `make_samples.py` (placeholder set), `pack_samples.py` (WAV to C++). |
 | `core/config/control_map.hpp` | Every control-to-function mapping. |
 | `hal/` | `hal.hpp` interface; `esp32/` and `sim/` implementations. |
 | `firmware/` | ESP-IDF entry point, tasks, mirror sender, PlatformIO project. |
@@ -61,7 +65,40 @@ Source: `docs/prototype1-sketch.jpg`.
 - **Light strip:** 2x16 DotStar LEDs behind a foggy acrylic panel, under the screen.
 - **Power:** USB-C only for prototype #1.
 - **Sketch layout:** screen center; d-pad left; A/B right of screen; speaker grille top right; encoders bottom right; 12 keys across the bottom (7 white, 5 black).
-- **Sound engine:** undecided. Assume a basic synthesizer.
+- **Sound engine:** generative beat maker on preloaded samples. No synthesis on the device.
+
+### Beat maker behavior
+
+You play; the box turns what you played into a loop, adds drums, and keeps it slowly changing.
+
+- **Loop:** 4 bars of 4/4 on a 16th grid, 64 steps. At tempo $B$ in BPM one step lasts $t_\text{step} = \frac{60}{4B}\ \text{s}$, e.g. 125 ms at 120 BPM. The transport always runs; the screen shows its position.
+- **Melodic keys** (the 8 non-pad keys) play the current instrument at once, pitched from its sample: $f = f_\text{root} \cdot 2^{(n - n_\text{root})/12}$. Each instrument plays in its sample's register.
+- **Seeding:** everything played on the melodic keys is captured. The seed commits after **5 s** with no key held (`kSeedIdleCommit`). Holding a key postpones the commit.
+- **Quantize:** on commit each note moves to the nearest 16th and its length to whole steps (1 to 16). Timing never has to be right. If nothing is playing, the loop restarts so the first note played lands on bar 1, beat 1.
+- **Accumulate:** playing again on the same instrument adds to the same layer (same pitch on the same step merges). Selecting another instrument commits a pending seed at once and starts a new layer on the next seed.
+- **Fade-in:** new or added notes ramp both the chance of playing and their velocity from 12 % to 100 % over **8 bars** (`kFadeInBars`).
+- **Generative loop:** the first full pass is your exact quantized seed. After that, at each loop start, a layer mutates with an intensity that ramps over 6 loops to about 1.5 changes per loop: drop a note, add a note, octave shift, rhythm nudge of $\pm 1$ step, passing tone, or restore a changed note to the seed. Added and passing notes use only pitches and pitch classes you played; octave shifts stay within one octave of your range. The more a layer drifts, the more likely it moves back toward the seed.
+- **Drums** (generated, on the 4 pad samples): silent until the first seed commits, then fade in over 8 bars. Kick on beat 1 and 3, snare on 2 and 4, hats on quarters, 8ths or 16ths, crash at each 4-bar phrase start, occasional open cymbal, ghost snares when busy, a snare fill in the last beat of some phrases. Density follows how many distinct steps your seeds use, plus a slow random walk. Extra kicks land on your strongest notes (velocity and length). Drums fade out when every layer is cleared.
+- **Layers:** up to **4** (`kMaxLayers`), each with its own seed, mutation state and fade. A 5th fades the oldest out over 8 bars. Switching instrument never cuts anything: held notes ring until released, old loops keep playing.
+- **Audio:** 32-voice sampler, 44.1 kHz stereo out, 22.05 kHz mono samples in flash. Every start ramps in over 2 ms; stolen or choked voices fade over 6 ms. Layer fades and clears are gain ramps, so nothing clicks. A cheap stereo reverb (4 combs, 4 allpasses) runs on both targets.
+- **Samples:** placeholders rendered offline by `tools/make_samples.py`: drums `kick`, `snare`, `hat`, `crash`; instruments `keys`, `pluck`, `bass`, `bell`, `marimba`, `pad` (looped). To use real samples, replace WAVs in `samples/`, edit `samples/manifest.csv` (root note, loop points, release), run `python tools/pack_samples.py`, rebuild. Total budget 1.5 MB of flash; the placeholders use 515 kB.
+
+### Control map
+
+| Control | Function |
+|---|---|
+| Keys C# D# F# G# (top-left 4) | Drum pads: kick, snare, hat, crash. Play live over the loop; never captured. |
+| Keys C D E F G A A# B | Current instrument, live; captured as the seed |
+| A tap | Next instrument (cursor; the name turns red) |
+| A hold 0.6 s | Select the instrument under the cursor |
+| B tap | Previous instrument |
+| A + B, release after 1 s | Clear current layer (fade 1.5 s). With only a pending seed on a new instrument, it drops that seed instead. |
+| A + B, hold 3 s | Clear everything (fade 2.5 s), drums stop |
+| Left encoder | Reverb, 2 % per detent |
+| Right encoder | BPM, 60 to 180, 1 per detent; glides, loop stays in sync |
+| D-pad, encoder pushes | Unassigned |
+
+Taps fire on release, so pressing A and B together never steps or selects; see `docs/controls.md` for the full chord logic. The screen shows instrument, BPM, reverb, the loop position across 4 bars, each layer with its fade state (red mark = the layer A+B clears), the seed countdown, and A/B hold progress with a mark at 1 s.
 
 ## 3. System block diagram
 
@@ -305,7 +342,7 @@ The board itself has **no audio hardware**. It exposes the I2S signals on **J3**
 
 **Board:** 2-layer, 1.6 mm FR-4, outline 120 mm x 55 mm. Default track 0.2 mm, power class 0.53 mm, vias 0.6/0.3 mm.
 
-## 14. Free resources for the synth
+## 14. Free resources
 
 - **GPIOs on header J12:** GPIO1, 9, 45, 46, 48 (watch strapping on 45/46) and GPIO8 (A5, ADC-capable).
 - **SPI ports J13/J14** on the shared SPI bus (GPIO35/36/37) with separate chip selects: use J13 for a microSD card reader (sample storage; the course list includes Adafruit 4682).
@@ -318,7 +355,7 @@ The board itself has **no audio hardware**. It exposes the I2S signals on **J3**
 
 | ID | Issue | Why it matters | Action |
 |---|---|---|---|
-| R1 | SPI uses **GPIO35, 36, 37** | On ESP32-S3-WROOM-1 variants with **octal PSRAM** (the "R8" modules), these pins are reserved for the PSRAM. The display bus would not work on those modules. The course board works, so the installed module probably has none or quad PSRAM. | **[verify]** the module's printed part number (e.g. N4, N8, N16 vs N8R8). It also decides how much RAM the synth has for samples. |
+| R1 | SPI uses **GPIO35, 36, 37** | On ESP32-S3-WROOM-1 variants with **octal PSRAM** (the "R8" modules), these pins are reserved for the PSRAM. The display bus would not work on those modules. The course board works, so the installed module probably has none or quad PSRAM. | **[verify]** the module's printed part number (e.g. N4, N8, N16 vs N8R8). It also decides how much RAM is free; the samples themselves live in flash. |
 | R2 | USB-C 500 mA to 1.5 A budget | LEDs plus DAC speaker amp may exceed it. | Cap LED brightness; check the amp's current at 3 W. |
 | R3 | LED logic level (3.3 V into 5 V SK9822) | Out of spec; flaky on some parts. | Test; add 74AHCT125 if needed. |
 | R4 | 20 on-board LEDs vs the sketch's 2x16 (32) strip | Different count. | Decide: external 32-LED strip on D24's chain, or redesign. |
@@ -335,7 +372,7 @@ The board itself has **no audio hardware**. It exposes the I2S signals on **J3**
 - **Simulator:** the same app code compiled for desktop with SDL2 (an on-screen replica with the same number of controls: 12 keys, 6 buttons, 2 encoders, a DotStar strip preview). Roughly laid out like the sketch; function mapping is up to the designer.
 - **Shape:**
   - `hal/`: hardware abstraction (display, keys, encoders, buttons, LEDs, audio out). One implementation for ESP32, one for the simulator.
-  - `core/`: UI, app logic, synth engine (basic synth for now).
+  - `core/`: UI, app logic, beat engine (sampler, seeds, layers, drums, reverb).
   - `firmware/`: ESP-IDF entry point and drivers.
   - `sim/`: SDL2 desktop build.
 - **Real-time rules:** audio on its own task, pinned to a core, fed by I2S DMA. I2C polling in a separate task. UI on the other core. No allocation in the audio callback.
@@ -343,7 +380,7 @@ The board itself has **no audio hardware**. It exposes the I2S signals on **J3**
 - **Buttons:** read the six debounced GPIOs as active-low; no software debounce.
 - **Course firmware:** the DAMNED course software is CircuitPython (libraries: `adafruit_st7789`, `adafruit_dotstar`, `cp_mcp3x21`, `button_handler`, `adafruit_display_text`). It is useful for quick bring-up tests of the same pins. The production OS here is C++.
 
-Status: synth engine, UI and simulator run on the PC. Firmware compiles for the ESP32-S3 but has not run on hardware, and the DAC driver is not written. See `docs/architecture.md`.
+Status: beat engine, UI and simulator run on the PC. Firmware compiles for the ESP32-S3 but has not run on hardware, and the DAC driver is not written. See `docs/architecture.md`.
 
 ### Run the simulator
 
@@ -361,7 +398,7 @@ build/danger_sim
 | `--mirror COM5` | Live screen of the real device over USB |
 | `--help` | Lists all flags |
 
-Controls: `docs/controls.md`. Esc quits.
+Computer keyboard: `A S D F G H J` and `U` melodic, `W E T Y` pads, `X` = A, `Z` = B, `K`/`L` reverb, `,`/`.` BPM. Mouse: click keys and buttons; right-click a button to latch it (A+B with one pointer); drag or scroll an encoder. Full list: `docs/controls.md`. Esc quits.
 
 ### Build the firmware
 

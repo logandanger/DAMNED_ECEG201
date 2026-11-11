@@ -1,0 +1,11 @@
+name,kind,file,root,loop_start,loop_end,release_s
+kick,drum,kick.wav,60,0,0,0.02
+snare,drum,snare.wav,60,0,0,0.02
+hat,drum,hat.wav,60,0,0,0.02
+crash,drum,crash.wav,60,0,0,0.02
+keys,inst,keys.wav,60,0,0,0.25
+pluck,inst,pluck.wav,60,0,0,0.15
+bass,inst,bass.wav,36,0,0,0.12
+bell,inst,bell.wav,72,0,0,0.6
+marimba,inst,marimba.wav,60,0,0,0.1
+pad,inst,pad.wav,60,17640,50714,0.6

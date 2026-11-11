@@ -36,14 +36,15 @@ target_compile_definitions(lvgl PUBLIC LV_CONF_INCLUDE_SIMPLE)
 
 # core/ without the display: everything the unit tests need.
 add_library(danger_engine STATIC
-  ${REPO}/core/synth/dsp.cpp
-  ${REPO}/core/synth/engine.cpp
-  ${REPO}/core/synth/params.cpp
-  ${REPO}/core/synth/presets.cpp
+  ${REPO}/core/audio/reverb.cpp
+  ${REPO}/core/audio/sampler.cpp
+  ${REPO}/core/beat/drums.cpp
+  ${REPO}/core/beat/engine.cpp
+  ${REPO}/core/beat/layer.cpp
+  ${REPO}/core/samples/sample_data.cpp
   ${REPO}/core/mirror/mirror_proto.cpp
   ${REPO}/core/mirror/mirror_sender.cpp
-  ${REPO}/core/ui/mapper.cpp
-  ${REPO}/core/ui/menu.cpp)
+  ${REPO}/core/ui/buttons.cpp)
 target_include_directories(danger_engine PUBLIC "${REPO}")
 target_compile_options(danger_engine PRIVATE -Wall -Wextra)
 

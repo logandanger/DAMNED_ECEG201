@@ -1,4 +1,4 @@
-// I2S output on its own task, pinned to core 1.
+// I2S output on its own task, pinned to core 1. The callback is BeatEngine::render.
 //
 // TODO(TLV320DAC3100): the DAC driver is out of scope for now, so this outputs valid I2S and the
 // DAC stays silent until these exist. All of it goes over I2C at 0x18 before audio starts:
@@ -24,7 +24,7 @@
 namespace hal {
 namespace {
 
-constexpr int kBlock = 128;  // core/synth/dsp.hpp kBlockFrames
+constexpr int kBlock = 128;  // core/config/beat_config.hpp kBlockFrames
 constexpr int kSampleRate = 44100;
 constexpr int kAudioCore = 1;
 constexpr uint32_t kCpuHz = 240000000;

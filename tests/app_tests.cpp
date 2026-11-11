@@ -3,6 +3,8 @@
 #include <cstring>
 
 #include "core/app.hpp"
+#include "core/config/beat_config.hpp"
+#include "core/ui/view.hpp"
 #include "hal/hal.hpp"
 
 using namespace danger;
@@ -23,25 +25,27 @@ void press(Control c) { app().on_control({c, EventType::Press, 0, hal::is_key(c)
 void release(Control c) { app().on_control({c, EventType::Release, 0, 0}); }
 void turn(Control c, int d) { app().on_control({c, EventType::Turn, int16_t(d), 0}); }
 
+// Advances UI time and audio together, as both run concurrently on the device.
 void tick(int ms = 40) {
+    static int16_t buf[cfg::kBlockFrames * 2];
+    static double audio_ms = 0;
     for (int i = 0; i < ms; i += 5) {
         g_now += 5;
         app().ui_tick();
+        while (audio_ms < g_now) {
+            app().engine().render(buf, cfg::kBlockFrames);
+            audio_ms += 1000.0 * cfg::kBlockFrames / cfg::kSampleRate;
+        }
     }
 }
 
-void render(int blocks = 4) {
-    static int16_t buf[kBlockFrames * 2];
-    for (int i = 0; i < blocks; ++i) app().engine().render(buf, kBlockFrames);
+int count_pixels(uint16_t color) {
+    int n = 0;
+    for (uint16_t p : g_fb) n += p == color;
+    return n;
 }
 
-bool playing(int note) {
-    for (int i = 0; i < kVoices; ++i) {
-        const Voice& v = app().engine().voice(i);
-        if (v.active() && !v.releasing() && v.note() == note) return true;
-    }
-    return false;
-}
+constexpr uint16_t kRed565 = ((0xE3 >> 3) << 11) | ((0x00 >> 2) << 5) | (0x0F >> 3);
 
 }  // namespace
 
@@ -62,83 +66,88 @@ int main() {
     tick(100);
     CHECK(g_flushed_pixels >= 320 * 240);  // first frame covers the screen
     CHECK(g_led_calls > 0);
-
-    // The screen has ink and paper.
-    int black = 0, white = 0;
-    for (uint16_t p : g_fb) { black += p == 0; white += p == 0xFFFF; }
+    int black = count_pixels(0), white = count_pixels(0xFFFF);
     std::printf("black %d, white %d\n", black, white);
-    CHECK(black > 1000 && white > 10000);
+    CHECK(black > 1000 && white > 30000);
 
-    // Key plays C4 at the fixed velocity.
-    press(Control::Key0);
-    render();
-    CHECK(playing(60));
-    release(Control::Key0);
-    render();
-    CHECK(!playing(60));
+    // A tap: cursor moves, nothing selected yet; the name turns red (browsing).
+    const int before_red = count_pixels(kRed565);
+    press(Control::A);
+    tick(100);
+    release(Control::A);
+    tick(100);
+    CHECK(app().browse() == 1);
+    CHECK(app().engine().status().instrument == 0);
+    CHECK(count_pixels(kRed565) > before_red + 50);
 
-    // B + Up: octave up, the cursor stays, B does not count as Back.
-    press(Control::Down);
-    tick();
-    const int cursor = app().menu().cursor();
-    CHECK(cursor == 1);
+    // B tap: back.
     press(Control::B);
-    press(Control::Up);
-    release(Control::Up);
+    tick(100);
     release(Control::B);
-    tick();
-    CHECK(app().params().get_int(ParamId::GlbOctave) == 1);
-    CHECK(app().menu().cursor() == cursor);
+    tick(100);
+    CHECK(app().browse() == 0);
 
-    // Note plays an octave higher, and a key held across a shift still releases.
-    press(Control::Key0);
-    render();
-    CHECK(playing(72));
+    // A tap to 1, then hold A to select it.
+    press(Control::A);
+    release(Control::A);
+    tick(50);
+    press(Control::A);
+    tick(int(cfg::kSelectHold * 1000) + 50);
+    release(Control::A);
+    tick(50);
+    CHECK(app().engine().status().instrument == 1);
+
+    // A+B for 0.5 s: no step, no select, no clear.
+    press(Control::A);
+    tick(60);
     press(Control::B);
-    press(Control::Down);
-    release(Control::Down);
+    tick(440);
+    release(Control::A);
     release(Control::B);
-    tick();
-    CHECK(app().params().get_int(ParamId::GlbOctave) == 0);
-    render();
-    CHECK(playing(72));
-    release(Control::Key0);
-    render();
-    CHECK(!playing(72));
+    tick(100);
+    CHECK(app().browse() == 1);
+    CHECK(app().engine().status().instrument == 1);
 
-    // Keys still play while B is held.
-    press(Control::B);
+    // Play and commit a seed through the key path; the layer shows up.
+    press(Control::Key0);
+    tick(100);
+    release(Control::Key0);
+    tick(200);
     press(Control::Key4);
-    render();
-    CHECK(playing(64));
+    tick(100);
     release(Control::Key4);
+    tick(100);
+    CHECK(app().engine().status().seed_notes == 2);
+    tick(int(cfg::kSeedIdleCommit * 1000) + 200);
+    EngineStatus s = app().engine().status();
+    CHECK(s.layer_count == 1 && s.layers[s.order[0]].state == LayerState::Active);
+    CHECK(s.drums > 0);
+
+    // Chord progress shows on screen while held; 1.5 s then release clears the layer.
+    press(Control::B);
+    press(Control::A);
+    tick(800);
+    const int red_mid_hold = count_pixels(kRed565);
+    tick(700);
+    CHECK(count_pixels(kRed565) > red_mid_hold);  // progress bar turns signal red past 1 s
+    release(Control::A);
     release(Control::B);
-    render();
-    tick();
+    tick(100);
+    s = app().engine().status();
+    CHECK(s.layers[s.order[0]].state == LayerState::FadingOut);
+    tick(int(cfg::kClearLayerFade * 1000) + 200);
+    CHECK(app().engine().status().layer_count == 0);
 
-    // Encoders: Pitch is highlighted. Coarse, fine, push to reset.
-    turn(Control::Enc1, 1);
+    // Encoders: left = reverb, right = BPM.
+    const float rev = app().engine().reverb_target(), bpm = app().engine().bpm_target();
+    turn(Control::Enc1, 5);
+    turn(Control::Enc2, -10);
     tick();
-    CHECK(app().params().get_int(ParamId::OscSemi) == 12);
-    turn(Control::Enc2, -2);
+    CHECK(app().engine().reverb_target() > rev);
+    CHECK(app().engine().bpm_target() == bpm - 10 * cfg::kBpmPerDetent);
+    turn(Control::Enc2, 1000);
     tick();
-    CHECK(app().params().get_int(ParamId::OscSemi) == 10);
-    press(Control::Enc2);
-    release(Control::Enc2);
-    tick();
-    CHECK(app().params().get_int(ParamId::OscSemi) == 0);
-
-    // Every screen renders with audio running, including through all group pages.
-    press(Control::Key0);
-    render();
-    for (int i = 0; i < 12; ++i) {
-        press(Control::Right);
-        release(Control::Right);
-        render();
-        tick();
-    }
-    CHECK(app().menu().group() == 2);
-    release(Control::Key0);
+    CHECK(app().engine().bpm_target() == cfg::kBpmMax);
 
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -1,7 +1,7 @@
 // Firmware entry. Task layout:
-//   core 1  audio   prio MAX-2  I2S, fed by Engine (hal/esp32/hal_audio.cpp)
+//   core 1  audio   prio MAX-2  I2S, fed by BeatEngine (hal/esp32/hal_audio.cpp)
 //   core 0  input   prio 10     buttons, I2C keys and encoders at 1 kHz (hal/esp32/hal_input.cpp)
-//   core 0  ui      prio 5      LVGL, menu, LEDs
+//   core 0  ui      prio 5      LVGL, A/B logic, encoders, LEDs
 //   core 0  mirror  prio 2      framebuffer streaming (mirror_task.cpp), optional
 #include "core/app.hpp"
 #include "freertos/FreeRTOS.h"

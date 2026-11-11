@@ -1,77 +1,64 @@
 # Controls
 
-**Status: proposal, awaiting approval.** The default mapping (section 1) is active. The proposed additions (section 2) are in the config file but switched off.
+All mappings live in [`core/config/control_map.hpp`](../core/config/control_map.hpp). Timing values live in [`core/config/beat_config.hpp`](../core/config/beat_config.hpp).
 
-All mappings live in one file: [`core/config/control_map.hpp`](../core/config/control_map.hpp). To approve section 2, set `kUseProposedMapping = true` and rebuild.
-
-## 1. Default mapping (active)
-
-This is the behaviour you specified, plus nothing else.
+## 1. Map
 
 | Control | Action | Computer keyboard |
 |---|---|---|
-| Key 1 to 12 | Play C to B, velocity fixed at 100 | `A W S E D F T G Y H U J` |
-| Up / Down | Move highlight | Arrow keys |
-| Left / Right | Previous / next parameter group | Arrow keys |
-| A | Enter page, load preset, or cycle an enum | `X` or `Return` |
-| B (tap) | Back out of a page | `Z` or `Backspace` |
-| B + Up / Down | Octave up / down, range $\pm 3$ | `Z` + arrow keys |
-| Encoder 1 turn | Value, coarse | `K` / `L` |
-| Encoder 2 turn | Value, fine | `,` / `.` |
-| Encoder 1 or 2 push | Reset value to default | `;` or `/` |
+| Key1, Key3, Key6, Key8 (C# D# F# G#, the top-left 4) | Drum pads: kick, snare, hat, crash. Live over the loop, not captured. | `W E T Y` |
+| Key0, 2, 4, 5, 7, 9, 10, 11 (C D E F G A A# B) | Current instrument, live and captured as the seed. Velocity from the key event (fixed 100 on prototype #1). | `A S D F G H U J` |
+| A tap | Instrument cursor up | `X` or `Return` |
+| A hold 0.6 s | Select the instrument under the cursor | hold `X` |
+| B tap | Instrument cursor down | `Z` or `Backspace` |
+| A + B released after 1 s | Clear current layer | `X` + `Z` |
+| A + B held 3 s | Clear everything | `X` + `Z` |
+| Left encoder | Reverb amount | `K` / `L` |
+| Right encoder | BPM | `,` / `.` |
+| D-pad, encoder pushes | Unassigned | |
 
-Without section 2, oscillator and preset selection go through the menus:
+Mouse on the replica: click keys and buttons. **Right-click a button to latch it**, which allows A + B with one pointer. Drag an encoder vertically or scroll over it to turn.
 
-- **Oscillator:** OSC group, Wave row. Turn either encoder, or press A to cycle.
-- **Preset:** GLB group, Preset row, A to open, Up/Down, A to load, B to leave.
+Melodic keys keep their chromatic pitch, so the 8 melodic keys give C D E F G A A# B. Change `kKeySemitone` to remap them.
 
-Mouse on the replica: click keys and buttons, drag along the keyboard to glide. Drag an encoder vertically or scroll over it to turn; click it to push. **Right-click a button to latch it**, which allows B + Up with one pointer.
+## 2. A/B chord logic
 
-## 2. Proposed additions (off until approved)
+State machine in [`core/ui/buttons.cpp`](../core/ui/buttons.cpp). Times from `beat_config.hpp`.
 
-| Control | Action | Why |
+| State | Event | Result |
 |---|---|---|
-| B + Left / Right | Previous / next preset | Changing sound is the most common action while playing. The menu route takes 5 presses or more. |
-| B + A | Next oscillator wave | Same reason. B and A sit together, so one hand does it and the other keeps playing. |
-| B + Encoder 1 turn | Volume, from any page | Volume should never need navigation. |
-| B + Encoder 2 turn | Filter cutoff, from any page | The one parameter worth having as a live performance control. |
-| B + Encoder 1 push | All notes off | Panic. A chord, so it cannot happen by accident. |
+| Idle | A down | **A only**, timer starts |
+| Idle | B down | **B only** |
+| A only | A up before 0.6 s | **Up**, back to Idle |
+| A only | 0.6 s reached | **Select**, fires while held, then Locked |
+| B only | B up | **Down**, back to Idle |
+| A only or B only | the other button down | **Chord**, timer restarts. The pending tap is dropped. |
+| Chord | either button up before 1 s | nothing; Locked |
+| Chord | either button up between 1 s and 3 s | **Clear layer**; Locked |
+| Chord | 3 s reached | **Clear all**, fires while held; Locked |
+| Locked | anything | nothing until both buttons are up, then Idle |
 
-The pattern: **B is the shift key.** Alone it is Back; held, every other control gets a second, performance-oriented function. Nothing in section 1 changes.
+Why this cannot conflict:
 
-## 3. Where parameters sit
+- **Taps fire on release.** A chord is detected when the second button goes down, which is always before the first is released. So A + B never produces Up, Down or Select, whatever the skew between the two presses.
+- **Hold actions are exclusive.** Select needs A alone; the clears need both. Once Select fires, B is ignored until both are up.
+- **One action per press cycle.** After any action, Locked blocks everything until both buttons are released.
+- **Debounce:** none in software. The on-board buttons go through the MC14490 hardware debouncer (README section 7), and the simulator's inputs are clean.
 
-Left/Right walks the five groups, wrapping at the ends. Effects has one level of sub-pages, which is what gives A and B something to do.
+Cost: Up and Down land on release, not press. A held longer than 0.6 s selects instead of stepping.
 
-| Group | Rows |
+**Which layer "clear layer" clears**, in order: the current instrument's layer, plus any pending seed. If the current instrument has no layer yet but a seed is pending, only that seed is dropped. Otherwise, the newest layer. The red mark on screen always shows the target.
+
+## 3. Screen
+
+| Area | Content |
 |---|---|
-| OSC | Wave, Pitch, Fine, Pulse width, Level |
-| FLT | Type, Cutoff, Resonance, Env amount, Key track |
-| ENV | Attack, Decay, Sustain, Release, then Flt attack, Flt decay, Flt sustain, Flt release |
-| FX | Drive / crush, Chorus / phaser, Delay, Reverb (each opens a page) |
-| GLB | Preset, Volume, Octave, LED level |
+| Head | Instrument (red, with "HOLD A TO SELECT", while the cursor is on another one), BPM, reverb % |
+| Loop | 4 bars with beat ticks, red playhead, `BAR n.b / 4` |
+| Layers | Oldest first: number, red mark on the clear target, instrument, `FADE IN n %` / `PLAYING notes` / `FADE OUT n %`, fade bar. Audio CPU load. |
+| Status | Seed: notes captured, commit countdown with a shrinking red bar. A/B: hold progress; chord bar turns red past 1 s, with a tick at 1 s. |
 
-Order follows the signal path, so Left/Right moves along the sound from source to output. Global values survive preset changes.
+## 4. Open points
 
-Step sizes: Encoder 1 moves continuous values $\frac{1}{25}$ of their range per detent, Encoder 2 $\frac{1}{250}$. Cutoff and times step on a logarithmic scale. Pitch moves 12 st or 1 st; Fine moves 10 ct or 1 ct.
-
-## 4. Conflicts and awkward ergonomics
-
-| # | Issue | Handling |
-|---|---|---|
-| 1 | **B is both Back and a modifier.** | Back fires on release, and only if nothing else was touched while B was held. Back therefore lands on release, not press. A press-and-hold with no chord still counts as Back. |
-| 2 | **Octave shift takes both hands.** The d-pad is far left and B is on the right, so playing stops during a shift. | This is the biggest ergonomic cost of the layout. Alternative for your decision: use `B + Encoder 2 turn` for octave rather than cutoff, which is one-handed on the right. |
-| 3 | **Order matters in chords.** Up then B navigates once, then B is a plain tap. | Intended: the modifier must go first. |
-| 4 | **Encoder push can fire while turning.** Pressing down slightly while turning resets the value, with no undo. | Your spec says push resets. If it bites in practice, change to long press or B + push. Only hardware testing will tell. |
-| 5 | **Both pushes do the same thing.** | As specified, but it uses up two controls. Encoder 2 push could become something else later. |
-| 6 | **Left/Right inside a sub-page** leaves it for the next group. | Chosen so that Left/Right always means the same thing. B returns to the parent with the cursor kept. |
-| 7 | **Encoders on an enum row** stop at the ends; A wraps. | Intended. |
-| 8 | **One octave of keys** has no high C. | Inherent to 12 keys. Octave shift covers it. |
-| 9 | **Keys are never blocked by B.** | Intended: chords must not interrupt playing. A key held across an octave shift releases the note it started. |
-| 10 | **PC keyboards ghost.** Some cannot report 3 or more keys in certain combinations. | Hardware limit of the keyboard. Use the mouse or try another chord. |
-
-## 5. Decisions needed
-
-1. Approve section 2, with or without changes.
-2. Conflict 2: keep B + Encoder 2 for cutoff, or use it for octave?
-3. The sketch shows two circles above the d-pad that nothing in the README accounts for. The replica omits them. Are they controls?
+1. The sketch shows two circles above the d-pad that nothing in the README accounts for. The replica omits them. Are they controls?
+2. The d-pad and encoder pushes have no function in the beat maker.

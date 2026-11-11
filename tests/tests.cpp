@@ -1,22 +1,24 @@
-// Headless unit tests: DSP, voice allocation, real-time rules, mapping, menu, mirror protocol.
+// Headless unit tests: samples, sampler, reverb, A/B logic, seeding, layers, mutation, drums,
+// real-time rules, mirror protocol.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <vector>
 
+#include "core/audio/reverb.hpp"
+#include "core/audio/sampler.hpp"
+#include "core/beat/drums.hpp"
+#include "core/beat/engine.hpp"
+#include "core/config/control_map.hpp"
 #include "core/mirror/mirror_proto.hpp"
 #include "core/mirror/mirror_sender.hpp"
-#include "core/synth/engine.hpp"
-#include "core/synth/presets.hpp"
-#include "core/ui/mapper.hpp"
-#include "core/ui/menu.hpp"
+#include "core/ui/buttons.hpp"
 
 using namespace danger;
-using hal::Control;
-using hal::ControlEvent;
-using hal::EventType;
 
 // Counts every heap allocation, to prove render() makes none.
 static size_t g_allocs = 0;
@@ -29,467 +31,509 @@ static int g_fail = 0, g_pass = 0;
 #define NEAR(a, b, tol) do { const double x_ = (a), y_ = (b); if (std::fabs(x_ - y_) <= (tol)) ++g_pass; else { ++g_fail; \
     std::printf("FAIL %s:%d  %s = %g, expected %g\n", __FILE__, __LINE__, #a, x_, y_); } } while (0)
 
+constexpr double kFs = cfg::kSampleRate;
+constexpr int kMelodic[8] = {0, 2, 4, 5, 7, 9, 10, 11};  // keys that are not drum pads
+
+// Engine driven in real time: keys and commands land at block starts, as on the device.
 struct Rig {
-    ParamStore params;
-    Engine engine;
-    Rig() { engine.init(&params); }
-    std::vector<int16_t> run(double seconds) {
-        const int blocks = static_cast<int>(seconds * kSampleRate / kBlockFrames);
-        std::vector<int16_t> out(static_cast<size_t>(blocks) * kBlockFrames * 2);
-        for (int b = 0; b < blocks; ++b) engine.render(out.data() + static_cast<size_t>(b) * kBlockFrames * 2, kBlockFrames);
-        return out;
+    std::unique_ptr<BeatEngine> e{new BeatEngine};
+    std::vector<int16_t> out;  // last run
+    double t = 0;
+
+    explicit Rig(float bpm = 120) {
+        e->init();
+        e->set_bpm(bpm);
+        run(1.5);  // tempo glide settles
     }
-    void on(int n) { engine.post_note({static_cast<uint8_t>(n), 100}); }
-    void off(int n) { engine.post_note({static_cast<uint8_t>(n), 0}); }
+    void run(double seconds) {
+        const int blocks = static_cast<int>(seconds * kFs / cfg::kBlockFrames + 0.5);
+        out.assign(static_cast<size_t>(blocks) * cfg::kBlockFrames * 2, 0);
+        for (int b = 0; b < blocks; ++b) e->render(out.data() + static_cast<size_t>(b) * cfg::kBlockFrames * 2, cfg::kBlockFrames);
+        t += blocks * cfg::kBlockFrames / kFs;
+    }
+    void key(int k, bool on, int vel = 100) { e->post_key({uint8_t(k), uint8_t(on ? vel : 0)}); }
+    void tap(int k, double hold = 0.1) { key(k, true); run(hold); key(k, false); }
+    void cmd(CommandType c, int arg = 0) { e->post_command({c, uint8_t(arg)}); }
+    EngineStatus st() const { return e->status(); }
+    int peak() const {
+        int p = 0;
+        for (int16_t s : out) p = std::max(p, std::abs(int(s)));
+        return p;
+    }
+    int active() const {
+        int n = 0;
+        for (int i = 0; i < kLayerSlots; ++i) n += e->layer(i).state == LayerState::Active;
+        return n;
+    }
+    int slot_of(int instrument) const {
+        for (int i = 0; i < kLayerSlots; ++i)
+            if (e->layer(i).state == LayerState::Active && e->layer(i).instrument == instrument) return i;
+        return -1;
+    }
+    // Plays a short phrase, then waits for the commit.
+    void seed(std::initializer_list<int> keys, double gap = 0.25) {
+        for (int k : keys) { tap(k, gap * 0.6); run(gap * 0.4); }
+        run(cfg::kSeedIdleCommit + 0.1);
+    }
 };
 
-static double rms(const std::vector<int16_t>& s, size_t from = 0) {
-    double a = 0;
-    for (size_t i = from; i < s.size(); ++i) a += double(s[i]) * s[i];
-    return std::sqrt(a / double(s.size() - from)) / 32768.0;
-}
+static double steps_per_s(float bpm) { return bpm / 60.0 * cfg::kStepsPerBeat; }
 
-static double goertzel(const std::vector<int16_t>& s, double hz) {
-    const double w = 2 * M_PI * hz / kSampleRate;
-    double re = 0, im = 0;
-    const size_t n = s.size() / 2;
-    for (size_t i = 0; i < n; ++i) {
-        const double win = 0.5 - 0.5 * std::cos(2 * M_PI * double(i) / double(n));
-        re += s[i * 2] * win * std::cos(w * double(i));
-        im += s[i * 2] * win * std::sin(w * double(i));
+// ---- Samples -----------------------------------------------------------------------------------
+
+static void test_samples() {
+    CHECK(kInstrumentCount >= 2);
+    for (int i = 0; i < kDrumCount; ++i) {
+        const Sample& s = kDrumSamples[i];
+        CHECK(s.length > 100 && s.loop_end == 0);
+        CHECK(std::abs(s.data[s.length - 1]) < 64);  // ends at zero: no click at the end
     }
-    return std::sqrt(re * re + im * im) / double(n) / 32768.0;
+    for (int i = 0; i < kInstrumentCount; ++i) {
+        const Sample& s = kInstrumentSamples[i];
+        CHECK(s.length > 1000 && s.release_s > 0);
+        CHECK(s.loop_end <= s.length && (s.loop_end == 0 || s.loop_end > s.loop_start + 1000));
+        if (s.loop_end == 0) CHECK(std::abs(s.data[s.length - 1]) < 64);
+    }
 }
 
-static double pitch_hz(const std::vector<int16_t>& s, size_t skip) {
-    double first = -1, last = -1;
-    int crossings = 0;
-    for (size_t i = skip + 2; i < s.size(); i += 2) {
-        if (s[i - 2] < 0 && s[i] >= 0) {
-            const double t = double(i / 2) - double(s[i]) / double(s[i] - s[i - 2]);
-            if (first < 0) first = t;
-            last = t;
-            ++crossings;
+// ---- Sampler -----------------------------------------------------------------------------------
+
+static float max_step(const std::vector<float>& x, size_t from, size_t to) {
+    float m = 0;
+    for (size_t i = from + 1; i < to; ++i) m = std::max(m, std::fabs(x[i] - x[i - 1]));
+    return m;
+}
+
+static void render_sampler(Sampler& s, std::vector<float>& out, int frames, float g = 1) {
+    float g0[kBusCount], g1[kBusCount];
+    for (int b = 0; b < kBusCount; ++b) g0[b] = g1[b] = g;
+    for (int done = 0; done < frames; done += 64) {
+        float buf[64] = {};
+        s.render(buf, 64, g0, g1);
+        out.insert(out.end(), buf, buf + 64);
+    }
+}
+
+static void test_sampler_pitch() {
+    // A one-shot read an octave up finishes in half the time; at the root it lasts its stored length.
+    const Sample& s = kInstrumentSamples[0];
+    CHECK(s.loop_end == 0);
+    auto frames_until_idle = [&](int note) {
+        Sampler sm;
+        sm.start({&s, note, 1, kBusLive, 0, 0});
+        float g[kBusCount];
+        for (float& x : g) x = 1;
+        int frames = 0;
+        float buf[64];
+        while (sm.active() && frames < 10 * cfg::kSampleRate) {
+            sm.render(buf, 64, g, g);
+            frames += 64;
         }
-    }
-    return (crossings - 1) * double(kSampleRate) / (last - first);
-}
-
-static void test_pitch_all_waves() {
-    const struct { Wave w; const char* n; } waves[] = {{Wave::Sine, "sine"}, {Wave::Saw, "saw"}, {Wave::Square, "square"}, {Wave::Triangle, "tri"}};
-    for (auto& w : waves) {
-        Rig r;
-        r.params.set(ParamId::OscWave, float(w.w));
-        r.params.set(ParamId::FltCutoff, 600);  // leaves the fundamental, so crossings are clean
-        r.on(69);
-        const double hz = pitch_hz(r.run(0.5), 4000);
-        std::printf("  %-6s A4 -> %.2f Hz\n", w.n, hz);
-        NEAR(hz, 440.0, 0.5);
-    }
-}
-
-static void test_noise() {
-    Rig w, p;
-    w.params.set(ParamId::OscWave, float(Wave::White));
-    p.params.set(ParamId::OscWave, float(Wave::Pink));
-    w.params.set(ParamId::FltCutoff, 18000);
-    p.params.set(ParamId::FltCutoff, 18000);
-    w.on(60); p.on(60);
-    const auto sw = w.run(1.0), sp = p.run(1.0);
-    CHECK(rms(sw, 4000) > 0.01);
-    CHECK(rms(sp, 4000) > 0.01);
-    // Pink falls 3 dB/oct: 200 Hz to 3.2 kHz is 4 octaves, about 12 dB. White stays flat.
-    auto band = [](const std::vector<int16_t>& s, double hz) {
-        double a = 0;
-        for (int i = -8; i <= 8; ++i) a += std::pow(goertzel(s, hz * (1 + i * 0.01)), 2);
-        return 10 * std::log10(a);
+        return frames;
     };
-    const double tilt_p = band(sp, 200) - band(sp, 3200), tilt_w = band(sw, 200) - band(sw, 3200);
-    std::printf("  tilt 200 Hz to 3.2 kHz: pink %.1f dB, white %.1f dB\n", tilt_p, tilt_w);
-    CHECK(tilt_p > 6 && tilt_p < 18);
-    CHECK(std::fabs(tilt_w) < 6);
+    const int root = frames_until_idle(s.root), up = frames_until_idle(s.root + 12), down = frames_until_idle(s.root - 7);
+    NEAR(double(root), double(s.length) * cfg::kSampleRate / kSampleRateHz, 128);
+    NEAR(double(root) / up, 2.0, 0.01);
+    NEAR(double(down) / root, std::pow(2.0, 7.0 / 12.0), 0.01);
 }
 
-static void test_blep_reduces_aliasing() {
-    // A 3520 Hz saw has harmonics at multiples of 3520; a naive one folds energy between them.
+static void test_sampler_no_clicks() {
+    const Sample* pad = &kInstrumentSamples[0];
+    for (int i = 0; i < kInstrumentCount; ++i)
+        if (kInstrumentSamples[i].loop_end) pad = &kInstrumentSamples[i];
+
+    // Steady level of the sustained note, sample to sample.
+    Sampler s;
+    const uint32_t h = s.start({pad, pad->root, 1, 0, 0, 0});
+    std::vector<float> out;
+    render_sampler(s, out, 30000);
+    const float normal = max_step(out, 10000, out.size());
+
+    // Start: ramps in, no step at the first sample.
+    CHECK(std::fabs(out[0]) < 0.01f);
+
+    // Kill the bus mid-note: fades out over the steal time, never jumps.
+    s.kill_bus(0);
+    const size_t at = out.size();
+    render_sampler(s, out, 4096);
+    CHECK(max_step(out, at - 1, out.size()) <= normal * 1.05f);
+    CHECK(std::fabs(out.back()) < 1e-6f);
+    CHECK(s.active() == 0);
+    s.release(h);  // stale handle: harmless
+
+    // Voice stealing: fill every voice with held notes, then one more. The stolen voice fades.
+    Sampler full;
+    for (int i = 0; i < cfg::kVoices; ++i) full.start({pad, pad->root + (i % 12), 0.05f, 1, 0, 0});
+    std::vector<float> o2;
+    render_sampler(full, o2, 8192);
+    const float before = max_step(o2, 4096, o2.size());
+    const size_t at2 = o2.size();
+    full.start({pad, pad->root + 3, 0.05f, kBusLive, 0, 0});
+    render_sampler(full, o2, 8192);
+    CHECK(max_step(o2, at2 - 1, o2.size()) <= before * 1.5f);
+    CHECK(full.active() == cfg::kVoices);
+}
+
+static void test_reverb() {
+    Reverb r;
+    r.set_amount(1);
+    std::vector<float> l(44100, 0), rr(44100, 0), in(44100, 0);
+    in[0] = 1;
+    for (int i = 0; i < 44100; i += 128) {
+        for (int j = 0; j < 128 && i + j < 44100; ++j) l[size_t(i + j)] = rr[size_t(i + j)] = 0;
+        r.process(in.data() + i, l.data() + i, rr.data() + i, std::min(128, 44100 - i));
+    }
+    float tail = 0;
+    for (int i = 4410; i < 44100; ++i) tail = std::max(tail, std::fabs(l[size_t(i)]));
+    CHECK(tail > 1e-4f);  // a tail exists 0.1 s after the impulse
+    CHECK(std::fabs(l[2000] - rr[2000]) > 0 || std::fabs(l[3000] - rr[3000]) > 0);  // stereo
+}
+
+// ---- A/B logic ---------------------------------------------------------------------------------
+
+static void test_buttons() {
+    using A = ButtonAction;
+    {
+        ButtonLogic b;
+        CHECK(b.press_a(0) == A::None);
+        CHECK(b.tick(100) == A::None);
+        CHECK(b.release_a(200) == A::Up);  // tap fires on release
+        CHECK(b.press_b(300) == A::None);
+        CHECK(b.release_b(400) == A::Down);
+    }
+    {   // A hold selects at kSelectHold, once, while held; the release does nothing.
+        ButtonLogic b;
+        b.press_a(1000);
+        CHECK(b.tick(1000 + uint32_t(cfg::kSelectHold * 1000) - 5) == A::None);
+        NEAR(b.progress(1000 + uint32_t(cfg::kSelectHold * 500)), 0.5, 0.02);
+        CHECK(b.tick(1000 + uint32_t(cfg::kSelectHold * 1000)) == A::Select);
+        CHECK(b.tick(5000) == A::None);
+        CHECK(b.release_a(5100) == A::None);
+    }
+    {   // A+B, 80 ms skew, released at 0.5 s: nothing at all, no Up, no Down.
+        ButtonLogic b;
+        b.press_a(0);
+        b.press_b(80);
+        for (uint32_t t = 80; t < 580; t += 5) CHECK(b.tick(t) == A::None);
+        CHECK(b.release_a(580) == A::None);
+        CHECK(b.release_b(600) == A::None);
+        CHECK(b.mode() == ButtonLogic::Mode::Idle);
+    }
+    {   // B first, then A, released after 1.5 s: clear layer, exactly once.
+        ButtonLogic b;
+        b.press_b(0);
+        b.press_a(40);
+        for (uint32_t t = 40; t < 1540; t += 5) CHECK(b.tick(t) == A::None);
+        CHECK(b.release_b(1540) == A::ClearLayer);
+        CHECK(b.tick(1600) == A::None);
+        CHECK(b.release_a(1700) == A::None);  // the leftover A is not a tap
+    }
+    {   // Held 3 s: clear all while held; releases do nothing more.
+        ButtonLogic b;
+        b.press_a(0);
+        b.press_b(30);
+        int all = 0;
+        for (uint32_t t = 30; t < 3500; t += 5) all += b.tick(t) == A::ClearAll;
+        CHECK(all == 1);
+        CHECK(b.release_a(3500) == A::None);
+        CHECK(b.release_b(3500) == A::None);
+    }
+    {   // A held past select, then B: no chord, nothing fires until both are up.
+        ButtonLogic b;
+        b.press_a(0);
+        CHECK(b.tick(700) == A::Select);
+        b.press_b(800);
+        CHECK(b.tick(5000) == A::None);
+        CHECK(b.release_b(5100) == A::None);
+        CHECK(b.release_a(5200) == A::None);
+        b.press_a(6000);
+        CHECK(b.release_a(6100) == A::Up);  // re-armed
+    }
+}
+
+// ---- Engine ------------------------------------------------------------------------------------
+
+static void test_silent_until_seed_and_live_keys() {
     Rig r;
-    r.params.set(ParamId::OscWave, float(Wave::Saw));
-    r.params.set(ParamId::FltCutoff, 18000);
-    r.params.set(ParamId::FltReso, 0);
-    r.params.set(ParamId::AmpS, 1);
-    r.on(105);
-    const auto s = r.run(1.0);
-    const double fund = goertzel(s, 3520);
-    const double alias = goertzel(s, 44100.0 - 13 * 3520.0);  // 13th harmonic folded to -1660 Hz
-    std::printf("  saw alias at 1.66 kHz: %.1f dB below fundamental\n", 20 * std::log10(fund / alias));
-    CHECK(fund / alias > 100);  // a naive saw's 13th harmonic sits only 22 dB down; require 40 dB
+    r.run(2);
+    CHECK(r.peak() == 0);  // no drums, no loop before the first seed
+    r.key(0, true);
+    r.run(0.01);
+    CHECK(r.peak() > 1000);  // live response within one block
+    r.key(0, false);
+    r.run(1);
+    r.key(1, true);  // kick pad, live
+    r.run(0.05);
+    CHECK(r.peak() > 1000);
+    r.key(1, false);
+    CHECK(r.st().seed_notes == 1);  // the melodic note was captured, the pad was not
 }
 
-static double filter_gain(FilterType t, double hz, double cutoff) {
-    Svf f;
-    f.set(float(cutoff), 0.0f);
-    double a = 0, b = 0;
-    const int n = 44100;
-    for (int i = 0; i < n; ++i) {
-        const float x = std::sin(2 * M_PI * hz * i / kSampleRate);
-        const float y = t == FilterType::LowPass ? f.low(x) : t == FilterType::HighPass ? f.high(x) : f.band(x);
-        if (i > n / 2) { a += double(y) * y; b += double(x) * x; }
-    }
-    return 10 * std::log10(a / b);
-}
-
-static void test_filter() {
-    NEAR(filter_gain(FilterType::LowPass, 100, 1000), 0, 0.5);
-    CHECK(filter_gain(FilterType::LowPass, 10000, 1000) < -30);
-    NEAR(filter_gain(FilterType::HighPass, 15000, 1000), 0, 0.5);
-    CHECK(filter_gain(FilterType::HighPass, 100, 1000) < -30);
-    CHECK(filter_gain(FilterType::BandPass, 1000, 1000) > filter_gain(FilterType::BandPass, 100, 1000) + 10);
-    CHECK(filter_gain(FilterType::BandPass, 1000, 1000) > filter_gain(FilterType::BandPass, 10000, 1000) + 10);
-
-    // Maximum resonance with a swept cutoff stays bounded.
-    Svf f;
-    double peak = 0;
-    for (int i = 0; i < 200000; ++i) {
-        if (i % 32 == 0) f.set(20.0f + 19000.0f * (0.5f + 0.5f * std::sin(i * 0.001f)), 1.0f);
-        const float y = f.low((i / 50) % 2 ? 1.0f : -1.0f);
-        CHECK(std::isfinite(y));
-        peak = std::fmax(peak, std::fabs(y));
-    }
-    std::printf("  SVF swept at max resonance: peak %.1f\n", peak);
-    CHECK(peak < 100);
-}
-
-static void test_envelope() {
+static void test_commit_timing() {
     Rig r;
-    r.params.set(ParamId::OscWave, float(Wave::Sine));
-    r.params.set(ParamId::AmpA, 100);
-    r.params.set(ParamId::AmpD, 100);
-    r.params.set(ParamId::AmpS, 0.5f);
-    r.params.set(ParamId::AmpR, 100);
-    r.on(69);
-    const auto a = r.run(0.05);
-    NEAR(r.engine.voice(0).level(), 0.5, 0.05);  // linear attack, halfway at 50 ms
-    r.run(0.5);
-    NEAR(r.engine.voice(0).level(), 0.5, 0.001);
-    r.off(69);
-    r.run(0.1);
-    CHECK(r.engine.voice(0).level() < 0.002);  // -60 dB in the release time
-    r.run(0.1);
-    CHECK(!r.engine.voice(0).active());
-    (void)a;
+    r.tap(0);
+    r.run(cfg::kSeedIdleCommit - 0.2);
+    CHECK(r.active() == 0);
+    CHECK(r.st().commit_in > 0 && r.st().commit_in < 0.3f);
+    r.run(0.3);
+    CHECK(r.active() == 1);
+    CHECK(r.st().seed_notes == 0);
+
+    // Keys held: never commits, however long.
+    Rig h;
+    h.key(0, true);
+    h.run(cfg::kSeedIdleCommit + 2);
+    CHECK(h.active() == 0);
+    h.key(0, false);
+    h.run(cfg::kSeedIdleCommit + 0.1);
+    CHECK(h.active() == 1);
 }
 
-static int held_voices(const Engine& e) { int n = 0; for (int i = 0; i < kVoices; ++i) n += e.voice(i).active(); return n; }
-static bool has_note(const Engine& e, int note) { for (int i = 0; i < kVoices; ++i) if (e.voice(i).active() && e.voice(i).note() == note) return true; return false; }
-
-static void test_voice_stealing() {
-    {   // Oldest held voice is stolen.
-        Rig r;
-        for (int n : {60, 62, 64, 65}) { r.on(n); r.run(0.01); }
-        CHECK(held_voices(r.engine) == 4);
-        r.on(67);
-        r.run(0.01);
-        CHECK(held_voices(r.engine) == 4);
-        CHECK(!has_note(r.engine, 60));
-        CHECK(has_note(r.engine, 62) && has_note(r.engine, 67));
-    }
-    {   // A releasing voice goes before a held one, however old the held one is.
-        Rig r;
-        r.params.set(ParamId::AmpR, 2000);
-        for (int n : {60, 62, 64, 65}) { r.on(n); r.run(0.01); }
-        r.off(64);
-        r.run(0.01);
-        r.on(67);
-        r.run(0.01);
-        CHECK(!has_note(r.engine, 64));
-        CHECK(has_note(r.engine, 60) && has_note(r.engine, 67));
-    }
-    {   // Same note reuses its voice.
-        Rig r;
-        r.on(60); r.run(0.01); r.on(60); r.run(0.01);
-        CHECK(held_voices(r.engine) == 1);
-    }
-    {   // Stealing does not click: the sample-to-sample step stays near the waveform's own.
-        Rig r;
-        r.params.set(ParamId::OscWave, float(Wave::Sine));
-        r.params.set(ParamId::AmpS, 1);
-        for (int n : {48, 52, 55, 59}) { r.on(n); r.run(0.05); }
-        r.on(40);
-        const auto s = r.run(0.02);
-        int step = 0;
-        for (size_t i = 2; i < s.size(); i += 2) step = std::max(step, std::abs(s[i] - s[i - 2]));
-        std::printf("  steal: max step %d of 32768\n", step);
-        CHECK(step < 2000);
-    }
+static void test_quantize() {
+    Rig r(120);  // 8 steps per second
+    const double sps = steps_per_s(120);
+    // Off-grid: 0, 2.3, 3.8 and 6.4 steps after the first note.
+    r.key(0, true); r.run(0.05); r.key(0, false);
+    r.run(2.3 / sps - 0.05);
+    r.key(4, true); r.run(0.05); r.key(4, false);
+    r.run(1.5 / sps - 0.05);
+    r.key(7, true); r.run(0.05); r.key(7, false);
+    r.run(2.6 / sps - 0.05);
+    r.key(4, true); r.run(1.0 / sps); r.key(4, false);  // held one step
+    r.run(cfg::kSeedIdleCommit + 0.1);
+    const int slot = r.slot_of(0);
+    CHECK(slot >= 0);
+    if (slot < 0) return;
+    const Layer& l = r.e->layer(slot);
+    CHECK(l.count() == 4);
+    int steps[4] = {}, notes[4] = {};
+    for (int i = 0; i < l.count() && i < 4; ++i) { steps[i] = l.note(i).step; notes[i] = l.note(i).note; }
+    CHECK(steps[0] == 0 && steps[1] == 2 && steps[2] == 4 && steps[3] == 6);  // first note on bar 1, beat 1
+    CHECK(notes[0] == 60 && notes[1] == 64 && notes[2] == 67 && notes[3] == 64);
+    CHECK(l.note(3).len == 1);
+    // The loop restarted at the commit: the seed's first note is on loop step 0.
 }
 
-static void test_all_presets_and_rt() {
-    for (int p = 0; p < preset_count(); ++p) {
-        Rig r;
-        preset_load(p, r.params);
-        const size_t before = g_allocs;
-        static int16_t block[kBlockFrames * 2];
-        int peak = 0;
-        double energy = 0;
-        for (int b = 0; b < 2000; ++b) {
-            if (b % 200 == 0) for (int k = 0; k < 6; ++k) r.on(48 + k * 5);
-            if (b % 200 == 120) for (int k = 0; k < 6; ++k) r.off(48 + k * 5);
-            r.engine.render(block, kBlockFrames);
-            for (int i = 0; i < kBlockFrames * 2; ++i) {
-                peak = std::max(peak, std::abs(int(block[i])));
-                energy += double(block[i]) * block[i];
-            }
-        }
-        std::printf("  %-6s peak %5.1f %%  rms %.3f\n", preset_name(p), peak / 327.68,
-                    std::sqrt(energy / (2000.0 * kBlockFrames * 2)) / 32768);
-        CHECK(g_allocs == before);
-        CHECK(peak > 300);
-        CHECK(peak <= 32767);
-    }
-}
-
-static void test_effects_active() {
-    const auto level_after_release = [](ParamId mix, float value) {
-        Rig r;
-        r.params.set(ParamId::OscWave, float(Wave::Saw));
-        r.params.set(ParamId::AmpR, 5);
-        r.params.set(mix, value);
-        r.on(60); r.run(0.1); r.off(60); r.run(0.05);
-        return rms(r.run(0.3));
-    };
-    CHECK(level_after_release(ParamId::DlyMix, 0) < 1e-4);
-    CHECK(level_after_release(ParamId::DlyMix, 0.5f) > 1e-3);
-    CHECK(level_after_release(ParamId::RevMix, 0.5f) > 1e-3);
-
-    // Reverb tail ends and does not blow up at maximum size.
+static void test_accumulate_and_switch() {
     Rig r;
-    r.params.set(ParamId::RevMix, 1);
-    r.params.set(ParamId::RevSize, 1);
-    r.params.set(ParamId::RevDamp, 0);
-    r.params.set(ParamId::DlyMix, 1);
-    r.params.set(ParamId::DlyFeedback, 0.9f);
-    r.on(60); r.run(0.5); r.off(60);
-    const double early = rms(r.run(1)), late = (r.run(10), rms(r.run(1)));
-    std::printf("  max feedback tail: %.4f then %.5f\n", early, late);
-    CHECK(late < early * 0.2);
+    r.seed({0, 4, 7});
+    const int a = r.slot_of(0);
+    CHECK(a >= 0 && r.e->layer(a).count() == 3);
+    r.seed({9, 11});  // same instrument: adds to the same layer
+    CHECK(r.active() == 1);
+    CHECK(r.e->layer(a).count() == 5);
+    CHECK(r.e->layer(a).seed_count() == 5);
 
-    // Chorus and phaser produce a stereo difference; dry does not.
-    for (float mode : {0.f, 1.f, 2.f}) {
-        Rig m;
-        m.params.set(ParamId::ModMode, mode);
-        m.params.set(ParamId::ModMix, 0.7f);
-        m.on(60);
-        const auto s = m.run(0.5);
-        double d = 0;
-        for (size_t i = 0; i + 1 < s.size(); i += 2) d += std::abs(s[i] - s[i + 1]);
-        if (mode == 0) CHECK(d == 0); else CHECK(d > 1000);
+    r.cmd(CommandType::SelectInstrument, 1);
+    r.run(0.05);
+    CHECK(r.e->layer(a).state == LayerState::Active);  // the old loop keeps playing
+    CHECK(r.st().instrument == 1);
+    r.seed({2, 5});
+    CHECK(r.active() == 2);
+    const int b = r.slot_of(1);
+    CHECK(b >= 0 && b != a);
+    CHECK(r.e->layer(b).count() == 2);
+    CHECK(r.e->layer(a).count() >= 4);  // untouched by the new layer (mutations aside)
+}
+
+static void test_switch_does_not_cut() {
+    // A held live note and the old layer's notes keep sounding across an instrument switch.
+    Rig r;
+    r.seed({0});
+    r.key(4, true);
+    r.run(0.05);
+    const int voices = r.e->active_voices();
+    r.cmd(CommandType::SelectInstrument, 2);
+    r.run(0.003);
+    CHECK(r.e->active_voices() >= voices);
+    r.run(0.2);
+    CHECK(r.peak() > 500);
+    r.key(4, false);
+}
+
+static void test_max_layers() {
+    Rig r;
+    for (int i = 0; i < cfg::kMaxLayers; ++i) {
+        r.cmd(CommandType::SelectInstrument, i % kInstrumentCount);
+        r.run(0.01);
+        r.seed({kMelodic[i]});
     }
-
-    // Crush at 3 bits leaves a few levels, and not silence.
-    Rig c;
-    c.params.set(ParamId::OscWave, float(Wave::Sine));
-    c.params.set(ParamId::DrvMode, 2);
-    c.params.set(ParamId::DrvBits, 3);
-    c.params.set(ParamId::OscLevel, 1);
-    c.params.set(ParamId::AmpS, 1);
-    c.params.set(ParamId::GlbVolume, 0);
-    c.on(60);
-    const auto s = c.run(0.3);
-    static bool seen[65536];
-    int distinct = 0;
-    for (size_t i = s.size() / 2; i < s.size(); i += 2) { auto& b = seen[s[i] + 32768]; if (!b) { b = true; ++distinct; } }
-    std::printf("  crush 3 bit: %d distinct values\n", distinct);
-    CHECK(distinct >= 3 && distinct <= 5);
+    CHECK(r.active() == cfg::kMaxLayers);
+    int oldest = -1;
+    for (int i = 0; i < kLayerSlots; ++i)
+        if (r.e->layer(i).state == LayerState::Active && (oldest < 0 || r.e->layer(i).serial < r.e->layer(oldest).serial)) oldest = i;
+    r.cmd(CommandType::SelectInstrument, cfg::kMaxLayers % kInstrumentCount);
+    r.run(0.01);
+    r.seed({kMelodic[5]});
+    CHECK(r.active() == cfg::kMaxLayers);
+    CHECK(r.e->layer(oldest).state == LayerState::FadingOut);
+    const float g0 = r.e->layer(oldest).gain;
+    r.run(1);
+    const float g1 = r.e->layer(oldest).gain;
+    CHECK(g1 < g0 && g1 > 0.5f * g0);  // slow, not cut
+    r.run(cfg::kEvictFadeBars * cfg::kStepsPerBar / steps_per_s(120) + 1);
+    CHECK(r.e->layer(oldest).state == LayerState::Free);
 }
 
-static void test_soft_clip() {
-    NEAR(soft_clip(0.01f) / 0.01f, 1.0, 0.001);
-    NEAR(soft_clip(1.5f), 1.0, 1e-5);
-    NEAR(soft_clip(9.0f), 1.0, 1e-5);
-    NEAR(soft_clip(-9.0f), -1.0, 1e-5);
+static void test_clear() {
+    Rig r;
+    r.seed({0, 4});
+    r.cmd(CommandType::SelectInstrument, 1);
+    r.run(0.01);
+    r.seed({7});
+    CHECK(r.active() == 2);
+    const int cur = r.slot_of(1);
+    r.cmd(CommandType::ClearLayer);
+    r.run(0.05);
+    CHECK(r.e->layer(cur).state == LayerState::FadingOut);
+    CHECK(r.e->layer(r.slot_of(0)).state == LayerState::Active);
+    r.run(cfg::kClearLayerFade);
+    CHECK(r.e->layer(cur).state == LayerState::Free);
+    CHECK(r.st().drums > 0.1f);  // one layer left: drums go on
+
+    // New instrument with only a pending seed: A+B discards that seed and leaves the loops alone.
+    r.cmd(CommandType::SelectInstrument, 2);
+    r.run(0.01);
+    r.tap(4);
+    CHECK(r.st().seed_notes == 1);
+    r.cmd(CommandType::ClearLayer);
+    r.run(0.05);
+    CHECK(r.st().seed_notes == 0);
+    CHECK(r.active() == 1);
+    r.run(cfg::kSeedIdleCommit + 0.5);
+    CHECK(r.active() == 1);  // nothing commits later either
+
+    r.cmd(CommandType::ClearAll);
+    r.run(cfg::kClearAllFade + 0.1);
+    CHECK(r.active() == 0);
+    CHECK(r.st().layer_count == 0);
+    CHECK(r.st().drums == 0);
+    r.run(8);  // reverb tail gone, nothing new starts
+    CHECK(r.peak() < 8);
 }
 
-// ---- Mapping ----------------------------------------------------------------------------------
-static ControlEvent press(Control c) { return {c, EventType::Press, 0, 0}; }
-static ControlEvent release(Control c) { return {c, EventType::Release, 0, 0}; }
-static ControlEvent turn(Control c, int d) { return {c, EventType::Turn, int16_t(d), 0}; }
-
-static void test_mapper() {
-    ControlMapper m;
-    CHECK(m.map(press(Control::Up)).action == Action::MenuUp);
-    CHECK(m.map(release(Control::Up)).action == Action::None);
-    CHECK(m.map(press(Control::Down)).action == Action::MenuDown);
-    CHECK(m.map(press(Control::Left)).action == Action::GroupPrev);
-    CHECK(m.map(press(Control::Right)).action == Action::GroupNext);
-    CHECK(m.map(press(Control::A)).action == Action::Select);
-    CHECK(m.map(press(Control::Enc1)).action == Action::ResetValue);
-    CHECK(m.map(press(Control::Enc2)).action == Action::ResetValue);
-    auto t = m.map(turn(Control::Enc1, 3));
-    CHECK(t.action == Action::AdjustCoarse && t.arg == 3);
-    t = m.map(turn(Control::Enc2, -2));
-    CHECK(t.action == Action::AdjustFine && t.arg == -2);
-
-    // B tap = Back, on release.
-    CHECK(m.map(press(Control::B)).action == Action::None);
-    CHECK(m.map(release(Control::B)).action == Action::Back);
-
-    // B + Up/Down shifts octave, never navigates, and suppresses Back.
-    CHECK(m.map(press(Control::B)).action == Action::None);
-    CHECK(m.map(press(Control::Up)).action == Action::OctaveUp);
-    CHECK(m.map(release(Control::Up)).action == Action::None);
-    CHECK(m.map(press(Control::Down)).action == Action::OctaveDown);
-    CHECK(m.map(release(Control::Down)).action == Action::None);
-    CHECK(m.map(release(Control::B)).action == Action::None);
-    CHECK(m.map(press(Control::Up)).action == Action::MenuUp);  // back to normal
-
-    // Unbound chord does nothing, and also suppresses Back.
-    CHECK(m.map(press(Control::B)).action == Action::None);
-    CHECK(m.map(press(Control::Left)).action == (kUseProposedMapping ? Action::PresetPrev : Action::None));
-    CHECK(m.map(turn(Control::Enc1, 1)).action == (kUseProposedMapping ? Action::AdjustVolume : Action::None));
-    CHECK(m.map(release(Control::B)).action == Action::None);
-
-    // Up held first, then B: Up navigated once, B release is a plain tap.
-    CHECK(m.map(press(Control::Up)).action == Action::MenuUp);
-    CHECK(m.map(press(Control::B)).action == Action::None);
-    CHECK(m.map(release(Control::Up)).action == Action::None);
-    CHECK(m.map(release(Control::B)).action == Action::Back);
+static void test_fade_in_and_first_pass_exact() {
+    Rig r;
+    r.seed({0, 2, 4, 5, 7, 9});
+    const int s = r.slot_of(0);
+    const Layer& l = r.e->layer(s);
+    CHECK(l.fade_in(r.e->global_step()) < 0.2f);
+    // First full pass: no mutation.
+    const double loop_s = cfg::kLoopSteps / steps_per_s(120);
+    r.run(loop_s * 0.98);
+    int drifted = 0;
+    for (int i = 0; i < l.count(); ++i) drifted += l.note(i).drifted();
+    CHECK(drifted == 0);
+    CHECK(l.count() == 6);
+    // Fade-in completes after kFadeInBars.
+    r.run(cfg::kFadeInBars * cfg::kStepsPerBar / steps_per_s(120));
+    NEAR(l.fade_in(r.e->global_step()), 1.0, 1e-6);
 }
 
-static void test_tables() {
-    for (size_t i = 0; i < sizeof(kDefaultBindings) / sizeof(Binding); ++i) {
-        for (size_t j = 0; j < sizeof(kProposedBindings) / sizeof(Binding); ++j) {
-            const Binding &a = kDefaultBindings[i], &b = kProposedBindings[j];
-            CHECK(!(a.control == b.control && a.trigger == b.trigger && a.modifier == b.modifier));
+static void test_mutation_constraints() {
+    Rig r(180);  // faster loops
+    r.seed({0, 4, 7, 11}, 0.12);
+    const int s = r.slot_of(0);
+    const Layer& l = r.e->layer(s);
+    const uint16_t pcs = (1u << 0) | (1u << 4) | (1u << 7) | (1u << 11);
+    int any_drift = 0;
+    for (int loop = 0; loop < 40; ++loop) {
+        r.run(cfg::kLoopSteps / steps_per_s(180));
+        int added = 0;
+        for (int i = 0; i < l.count(); ++i) {
+            const PatternNote& n = l.note(i);
+            CHECK(pcs & (1u << (n.pitch() % 12)));  // only pitch classes that were played
+            CHECK(std::abs(n.nudge) <= cfg::kMaxNudgeSteps);
+            CHECK(n.pitch() >= 60 - 12 && n.pitch() <= 71 + 12);
+            added += n.added();
+            any_drift += n.drifted();
         }
+        CHECK(added <= std::max(2, int(4 * cfg::kMaxAddedRatio)));
+        CHECK(l.seed_count() == 4);
     }
-    bool key_seen[hal::kKeyCount] = {};
-    for (const PcKey& k : kPcKeys) {
-        for (const PcKey& o : kPcKeys) CHECK(&k == &o || std::strcmp(k.key, o.key) != 0);
-        if (hal::is_key(k.control)) key_seen[hal::key_index(k.control)] = true;
-    }
-    for (bool s : key_seen) CHECK(s);
+    CHECK(any_drift > 0);  // it does mutate
 }
 
-static void test_menu() {
-    ParamStore p;
-    Menu m(&p);
-    auto act = [&](Action a, int arg = 0) { m.handle({a, int16_t(arg)}); };
+static void test_drums() {
+    DrumGen d;
+    d.reset(7);
+    float acc[cfg::kStepsPerBar] = {};
+    acc[6] = 1.0f;  // a strong seed note on the "and" of 2
+    d.new_bar(1, acc, 0.1f);
+    CHECK(d.hit(0, Drum::Kick) > 0);
+    CHECK(d.hit(4, Drum::Snare) > 0 && d.hit(12, Drum::Snare) > 0);
+    CHECK(d.hit(6, Drum::Kick) > 0);  // kick follows the strong note
+    int hats_sparse = 0;
+    for (int s = 0; s < cfg::kStepsPerBar; ++s) hats_sparse += d.hit(s, Drum::Hat) > 0;
+    const float sparse = d.density();
 
-    CHECK(m.page() == PageId::Oscillator && m.cursor() == 0);
-    act(Action::MenuUp);
-    CHECK(m.cursor() == 0);
-    act(Action::MenuDown);
-    CHECK(m.cursor() == 1);
+    DrumGen busy;
+    busy.reset(7);
+    float flat[cfg::kStepsPerBar] = {};
+    busy.new_bar(1, flat, 0.4f);
+    int hats_busy = 0;
+    for (int s = 0; s < cfg::kStepsPerBar; ++s) hats_busy += busy.hit(s, Drum::Hat) > 0;
+    CHECK(busy.density() > sparse);
+    CHECK(hats_busy > hats_sparse);
 
-    // Coarse and fine on an integer, then reset.
-    act(Action::AdjustCoarse, 1);
-    NEAR(p.get(ParamId::OscSemi), 12, 0);
-    act(Action::AdjustFine, 1);
-    NEAR(p.get(ParamId::OscSemi), 13, 0);
-    act(Action::ResetValue);
-    NEAR(p.get(ParamId::OscSemi), 0, 0);
+    d.new_bar(0, flat, 0.2f);
+    CHECK(d.hit(0, Drum::Crash) > 0);  // phrase boundary
 
-    // A cycles an enum and wraps.
-    act(Action::MenuUp);
-    for (int i = 0; i < 5; ++i) act(Action::Select);
-    NEAR(p.get(ParamId::OscWave), 0, 0);
-
-    // Group order, with wrap.
-    const PageId order[] = {PageId::Filter, PageId::Envelope, PageId::Effects, PageId::Global, PageId::Oscillator};
-    for (PageId g : order) { act(Action::GroupNext); CHECK(m.page() == g); }
-    act(Action::GroupPrev);
-    CHECK(m.page() == PageId::Global);
-
-    // Scrolling: 8 envelope rows, 6 visible.
-    act(Action::GroupPrev); act(Action::GroupPrev);
-    CHECK(m.page() == PageId::Envelope);
-    for (int i = 0; i < 12; ++i) act(Action::MenuDown);
-    CHECK(m.cursor() == 7 && m.top() == 2);
-    for (int i = 0; i < 12; ++i) act(Action::MenuUp);
-    CHECK(m.cursor() == 0 && m.top() == 0);
-
-    // Enter and leave a subpage; the parent keeps its cursor.
-    act(Action::GroupNext);
-    act(Action::MenuDown); act(Action::MenuDown);
-    act(Action::Select);
-    CHECK(m.page() == PageId::Delay && m.in_subpage());
-    act(Action::Back);
-    CHECK(m.page() == PageId::Effects && m.cursor() == 2);
-    act(Action::Back);
-    CHECK(m.page() == PageId::Effects);
-
-    // Left/Right from a subpage goes to the neighbouring group.
-    act(Action::Select);
-    act(Action::GroupNext);
-    CHECK(m.page() == PageId::Global && !m.in_subpage());
-
-    // Encoders and reset do nothing on a link row.
-    const uint32_t gen = p.generation();
-    act(Action::AdjustCoarse, 1);
-    act(Action::ResetValue);
-    CHECK(p.generation() == gen);
-
-    // Presets keep global values.
-    p.set(ParamId::GlbVolume, -20);
-    act(Action::Select);
-    CHECK(m.page() == PageId::Presets);
-    act(Action::MenuDown);
-    act(Action::Select);
-    CHECK(m.preset() == 1);
-    NEAR(p.get(ParamId::GlbVolume), -20, 0);
-    NEAR(p.get(ParamId::OscWave), float(Wave::Square), 0);
-
-    // Octave clamps at +-3.
-    for (int i = 0; i < 9; ++i) act(Action::OctaveUp);
-    NEAR(p.get(ParamId::GlbOctave), 3, 0);
-
-    // Every row of every page is reachable and every param appears exactly once.
-    int seen[kParamCount] = {};
-    for (int g = 0; g < kGroupCount; ++g) {
-        Menu w(&p);
-        for (int i = 0; i < g; ++i) w.handle({Action::GroupNext, 0});
-        for (int i = 0; i < w.row_count(); ++i) {
-            const Row r = w.row(i);
-            if (r.kind == RowKind::Param) ++seen[int(r.param)];
-            if (r.kind == RowKind::Page && r.target != PageId::Presets) {
-                for (int k = 0; k < i; ++k) w.handle({Action::MenuDown, 0});
-                w.handle({Action::Select, 0});
-                for (int j = 0; j < w.row_count(); ++j) ++seen[int(w.row(j).param)];
-                w.handle({Action::Back, 0});
-                for (int k = 0; k < i; ++k) w.handle({Action::MenuUp, 0});
-            }
-        }
+    // Density walks slowly: bar-to-bar change is bounded.
+    DrumGen w;
+    w.reset(3);
+    float prev = -1;
+    for (int bar = 0; bar < 64; ++bar) {
+        w.new_bar(bar % 4, flat, 0.2f);
+        if (prev >= 0) CHECK(std::fabs(w.density() - prev) <= cfg::kDrumDriftPerBar + 1e-6f);
+        prev = w.density();
     }
-    for (int s : seen) CHECK(s == 1);
 }
 
-static void test_params() {
-    for (int i = 0; i < kParamCount; ++i) {
-        const ParamId id = ParamId(i);
-        const ParamDef& d = param_def(id);
-        CHECK(d.def >= d.min && d.def <= d.max);
-        NEAR(param_normalized(id, d.min), 0, 1e-5);
-        NEAR(param_normalized(id, d.max), 1, 1e-5);
-        if (d.curve == Curve::Exp || d.curve == Curve::Linear) {
-            NEAR(param_from_normalized(id, param_normalized(id, d.def)), d.def, std::fabs(d.def) * 1e-4 + 1e-5);
-        }
-        char buf[24];
-        param_format(id, d.min, buf, sizeof buf);
-        CHECK(buf[0] != 0);
-        param_format(id, d.max, buf, sizeof buf);
-        CHECK(buf[0] != 0);
-    }
-    ParamStore p;
-    char b[24];
-    param_format(ParamId::FltCutoff, 8000, b, sizeof b);
-    CHECK(!std::strcmp(b, "8.00 kHz"));
-    param_format(ParamId::AmpR, 150, b, sizeof b);
-    CHECK(!std::strcmp(b, "150 ms"));
-    param_format(ParamId::OscWave, 3, b, sizeof b);
-    CHECK(!std::strcmp(b, "Triangle"));
+static void test_drums_follow_layers() {
+    Rig r;
+    r.seed({0});
+    CHECK(r.st().drums > 0 && r.st().drums < 0.3f);  // fading in
+    r.run(cfg::kFadeInBars * cfg::kStepsPerBar / steps_per_s(120) + 0.5);
+    NEAR(r.st().drums, 1.0, 1e-6);
 }
 
-// ---- Mirror -----------------------------------------------------------------------------------
+static void test_tempo_keeps_sync() {
+    Rig r(100);
+    r.seed({0, 4, 7});
+    r.run(1.1);
+    const float before = r.st().loop_pos;
+    r.e->set_bpm(170);
+    r.run(0.01);
+    const float after = r.st().loop_pos;
+    // Phase is continuous: a tempo change only alters the rate.
+    CHECK(after >= before && after - before < 0.5f);
+    const uint32_t s0 = r.e->global_step();
+    r.run(2);  // glide settles to 170 BPM
+    const uint32_t s1 = r.e->global_step();
+    r.run(4);
+    NEAR(double(r.e->global_step() - s1) / 4.0, steps_per_s(170), 0.3);
+    CHECK(s1 > s0);
+}
+
+static void test_no_alloc_under_load() {
+    Rig r;
+    for (int i = 0; i < cfg::kMaxLayers + 1; ++i) {
+        r.cmd(CommandType::SelectInstrument, i % kInstrumentCount);
+        r.run(0.01);
+        r.seed({0, 2, 4, 5, 7, 9, 10, 11}, 0.08);
+    }
+    r.e->set_reverb(1);
+    const size_t before = g_allocs;
+    static int16_t block[cfg::kBlockFrames * 2];
+    for (int i = 0; i < 20000; ++i) {
+        if (i % 50 == 0) r.e->post_key({uint8_t(kMelodic[i / 50 % 8]), uint8_t(i / 50 % 2 ? 0 : 90)});
+        if (i % 300 == 0) r.e->post_key({1, 100});
+        r.e->render(block, cfg::kBlockFrames);
+    }
+    CHECK(g_allocs == before);
+}
+
 struct Screen : mirror::Decoder::Sink {
     std::vector<uint16_t> fb = std::vector<uint16_t>(320 * 240, 0);
     int frames = 0, errors = 0, hellos = 0, rects = 0;
@@ -630,13 +674,17 @@ static void test_mirror_stream() {
     CHECK(rx.fb == src);
 }
 
+
 int main() {
     const struct { const char* name; void (*fn)(); } tests[] = {
-        {"soft clip", test_soft_clip}, {"pitch", test_pitch_all_waves}, {"noise", test_noise},
-        {"polyBLEP", test_blep_reduces_aliasing}, {"filter", test_filter}, {"envelope", test_envelope},
-        {"voice stealing", test_voice_stealing}, {"presets and no-alloc", test_all_presets_and_rt},
-        {"effects", test_effects_active}, {"params", test_params}, {"mapper", test_mapper},
-        {"mapping tables", test_tables}, {"menu", test_menu}, {"rle", test_rle}, {"mirror stream", test_mirror_stream},
+        {"samples", test_samples}, {"sampler pitch", test_sampler_pitch}, {"sampler no clicks", test_sampler_no_clicks},
+        {"reverb", test_reverb}, {"A/B logic", test_buttons},
+        {"silent until seed, live keys", test_silent_until_seed_and_live_keys}, {"commit timing", test_commit_timing},
+        {"quantize", test_quantize}, {"accumulate and switch", test_accumulate_and_switch},
+        {"switch does not cut", test_switch_does_not_cut}, {"max layers", test_max_layers}, {"clear", test_clear},
+        {"fade-in, exact first pass", test_fade_in_and_first_pass_exact}, {"mutation constraints", test_mutation_constraints},
+        {"drums", test_drums}, {"drums follow layers", test_drums_follow_layers}, {"tempo keeps sync", test_tempo_keeps_sync},
+        {"no alloc under load", test_no_alloc_under_load}, {"rle", test_rle}, {"mirror stream", test_mirror_stream},
     };
     for (auto& t : tests) {
         std::printf("%s\n", t.name);

@@ -7,7 +7,7 @@ Read `README.md` first. It documents the whole circuit (power, pin map, display,
 Decisions:
 - Stack: C++, PlatformIO + ESP-IDF, LVGL at 320x240, SDL2 desktop simulator sharing `core/` with firmware via a `hal/` layer.
 - Prototype #1: 12 plain on/off keys via AW9523 (no velocity yet, but key events carry a velocity field), 2 I2C encoders, 6 on-board buttons (hardware-debounced, active-low), TLV320DAC3100 audio (PAM8302 dropped), USB-C power only.
-- Sound engine: undecided, assume a basic synth.
+- Sound engine: generative beat maker on preloaded samples (no synthesis on the device). Behavior and control map: README section 2. Tunables: `core/config/beat_config.hpp`.
 - Simulator is an on-screen replica with the same number of controls; the user maps functions.
 
 User preferences: blunt and short answers, code without explanation unless asked, SI units, LaTeX equations, verify uncertain facts, minimal Swiss-style design.

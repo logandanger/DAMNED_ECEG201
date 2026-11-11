@@ -2,8 +2,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
-#include "core/synth/presets.hpp"
+#include "core/config/beat_config.hpp"
 #include "hal/hal.hpp"
 #include "lvgl.h"
 
@@ -13,31 +14,50 @@ namespace {
 // Swiss palette: black on white, one signal red.
 constexpr uint32_t kInk = 0x000000, kPaper = 0xFFFFFF, kGrey = 0x8C8C8C, kRule = 0xD0D0D0, kSignal = 0xE3000F;
 
-constexpr int kTabH = 20, kScopeY = 20, kScopeH = 64;
-constexpr int kRowsY = 85, kRowH = 22;
-constexpr int kStatusY = kRowsY + kVisibleRows * kRowH + 1;
-constexpr int kNameX = 8, kBarX = 112, kBarW = 112, kBarH = 6;
-constexpr int kScopePoints = 160, kScopeSamples = 480, kScopeWindow = 1024, kScopeGain = 2;
+constexpr int kMargin = 8;
+constexpr int kContentW = kScreenWidth - 2 * kMargin;
+
+// Grid, top to bottom.
+constexpr int kHeadY = 0, kHeadH = 48;
+constexpr int kLoopY = kHeadY + kHeadH + 1, kLoopBarsY = kLoopY + 18, kLoopBarsH = 16;
+constexpr int kLayersY = kLoopBarsY + kLoopBarsH + 6, kLayerRowY = kLayersY + 18, kLayerRowH = 15;
+constexpr int kStatusY = kLayerRowY + kLayerSlots * kLayerRowH + 2;
+
+constexpr int kBpmX = 168, kRevX = 244;
+constexpr int kLayerStateX = 120, kLayerBarX = 222, kLayerBarW = kScreenWidth - kMargin - kLayerBarX;
+constexpr int kHoldBarX = 232, kHoldBarW = kScreenWidth - kMargin - kHoldBarX;
 
 constexpr int kDrawLines = 40;
 alignas(4) uint8_t g_draw_buf[kScreenWidth * kDrawLines * 2];
 
-struct RowView {
-    lv_obj_t *box, *name, *value, *track, *fill;
-    char name_text[24], value_text[24];
-    int fill_w;
-    bool selected, has_bar;
+struct Text {
+    lv_obj_t* obj;
+    char cache[48];
+    uint32_t color;
+};
+
+struct Bar {
+    lv_obj_t *track, *fill;
+    int w, full;
+    uint32_t color;
+};
+
+struct LayerRow {
+    Text index, name, state;
+    lv_obj_t* mark;
+    Bar bar;
+    bool mark_on, visible;
 };
 
 struct ViewState {
-    lv_obj_t* tabs[kGroupCount];
-    lv_obj_t* preset;
-    lv_obj_t* scope;
-    lv_point_precise_t points[kScopePoints];
-    RowView rows[kVisibleRows];
-    lv_obj_t *title, *status;
-    char title_text[32], status_text[48], preset_text[24];
-    int shown_group;
+    Text inst_cap, inst, bpm, rev, loop_cap, bar_text, layers_cap, cpu, seed, hold;
+    lv_obj_t* playhead;
+    int playhead_x;
+    lv_obj_t* bar_box[cfg::kLoopBars];
+    int shown_bar;
+    LayerRow rows[kLayerSlots];
+    Bar seed_bar, hold_bar;
+    lv_obj_t* hold_tick;
 } g;
 
 void flush_cb(lv_display_t* disp, const lv_area_t* a, uint8_t* px) {
@@ -60,128 +80,178 @@ lv_obj_t* box(lv_obj_t* parent, int x, int y, int w, int h, uint32_t color) {
     return o;
 }
 
-lv_obj_t* label(lv_obj_t* parent, int x, int y, int w, const lv_font_t* font, lv_text_align_t align) {
+Text label(lv_obj_t* parent, int x, int y, int w, const lv_font_t* font, lv_text_align_t align, uint32_t color) {
     lv_obj_t* o = lv_label_create(parent);
     lv_obj_set_pos(o, x, y);
     lv_obj_set_width(o, w);
     lv_label_set_long_mode(o, LV_LABEL_LONG_MODE_CLIP);
     lv_obj_set_style_text_font(o, font, 0);
     lv_obj_set_style_text_align(o, align, 0);
-    lv_obj_set_style_text_color(o, lv_color_hex(kInk), 0);
+    lv_obj_set_style_text_color(o, lv_color_hex(color), 0);
     lv_label_set_text_static(o, "");
-    return o;
+    Text t{o, "", color};
+    return t;
 }
 
-void set_text(lv_obj_t* o, char* cache, size_t size, const char* text) {
-    if (std::strcmp(cache, text) == 0) return;
-    std::snprintf(cache, size, "%s", text);
-    lv_label_set_text(o, cache);
+void set_text(Text& t, const char* text) {
+    if (std::strcmp(t.cache, text) == 0) return;
+    std::snprintf(t.cache, sizeof(t.cache), "%s", text);
+    lv_label_set_text(t.obj, t.cache);
 }
 
-void build_rows(lv_obj_t* screen) {
-    for (int i = 0; i < kVisibleRows; ++i) {
-        RowView& r = g.rows[i];
-        r.box = box(screen, 0, kRowsY + i * kRowH, kScreenWidth, kRowH, kPaper);
-        r.name = label(r.box, kNameX, 3, kBarX - kNameX - 4, &lv_font_montserrat_14, LV_TEXT_ALIGN_LEFT);
-        r.track = box(r.box, kBarX, (kRowH - 1) / 2, kBarW, 1, kRule);
-        r.fill = box(r.box, kBarX, (kRowH - kBarH) / 2, 0, kBarH, kInk);
-        r.value = label(r.box, kBarX + kBarW + 4, 3, kScreenWidth - kBarX - kBarW - 4 - 8, &lv_font_montserrat_14,
-                        LV_TEXT_ALIGN_RIGHT);
-        r.fill_w = -1;
-        r.has_bar = true;
+void set_color(Text& t, uint32_t color) {
+    if (t.color == color) return;
+    t.color = color;
+    lv_obj_set_style_text_color(t.obj, lv_color_hex(color), 0);
+}
+
+Bar bar(lv_obj_t* parent, int x, int y, int w) {
+    Bar b;
+    b.track = box(parent, x, y + 2, w, 1, kRule);
+    b.fill = box(parent, x, y, 0, 5, kInk);
+    b.w = 0;
+    b.full = w;
+    b.color = kInk;
+    return b;
+}
+
+void set_bar(Bar& b, float v, uint32_t color) {
+    v = v < 0 ? 0 : (v > 1 ? 1 : v);
+    const int w = static_cast<int>(v * static_cast<float>(b.full) + 0.5f);
+    if (w != b.w) {
+        b.w = w;
+        lv_obj_set_width(b.fill, w);
+    }
+    if (color != b.color) {
+        b.color = color;
+        lv_obj_set_style_bg_color(b.fill, lv_color_hex(color), 0);
     }
 }
 
-void set_selected(RowView& r, bool selected) {
-    if (r.selected == selected) return;
-    r.selected = selected;
-    const lv_color_t fg = lv_color_hex(selected ? kPaper : kInk);
-    lv_obj_set_style_bg_color(r.box, lv_color_hex(selected ? kInk : kPaper), 0);
-    lv_obj_set_style_text_color(r.name, fg, 0);
-    lv_obj_set_style_text_color(r.value, fg, 0);
-    lv_obj_set_style_bg_color(r.fill, selected ? lv_color_hex(kSignal) : fg, 0);
-    lv_obj_set_style_bg_color(r.track, lv_color_hex(selected ? kGrey : kRule), 0);
+void show(lv_obj_t* o, bool on) {
+    if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
 }
 
-void set_bar(RowView& r, bool visible, int fill_w) {
-    if (visible != r.has_bar) {
-        r.has_bar = visible;
-        if (visible) {
-            lv_obj_remove_flag(r.track, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(r.fill, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(r.track, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(r.fill, LV_OBJ_FLAG_HIDDEN);
+const char* inst_name(int i) { return i >= 0 && i < kInstrumentCount ? kInstrumentSamples[i].name : ""; }
+
+// ---- Sections ----------------------------------------------------------------------------------
+
+void update_head(const ViewModel& m) {
+    const bool browsing = m.browse != m.s.instrument;
+    set_text(g.inst_cap, browsing ? "HOLD A TO SELECT" : "INSTRUMENT");
+    set_color(g.inst_cap, browsing ? kSignal : kGrey);
+    set_text(g.inst, inst_name(m.browse));
+    set_color(g.inst, browsing ? kSignal : kInk);
+    char t[16];
+    std::snprintf(t, sizeof(t), "%d", static_cast<int>(m.s.bpm + 0.5f));
+    set_text(g.bpm, t);
+    std::snprintf(t, sizeof(t), "%d%%", static_cast<int>(m.s.reverb * 100.0f + 0.5f));
+    set_text(g.rev, t);
+}
+
+void update_loop(const ViewModel& m) {
+    const float pos = m.s.loop_pos;
+    const int x = kMargin + static_cast<int>(pos / cfg::kLoopSteps * static_cast<float>(kContentW));
+    if (x != g.playhead_x) {
+        g.playhead_x = x;
+        lv_obj_set_x(g.playhead, x > kMargin + kContentW - 2 ? kMargin + kContentW - 2 : x);
+    }
+    const int bar = static_cast<int>(pos) / cfg::kStepsPerBar;
+    if (bar != g.shown_bar) {
+        g.shown_bar = bar;
+        for (int i = 0; i < cfg::kLoopBars; ++i)
+            lv_obj_set_style_border_color(g.bar_box[i], lv_color_hex(i == bar ? kInk : kRule), 0);
+    }
+    char t[24];
+    const int beat = static_cast<int>(pos) % cfg::kStepsPerBar / cfg::kStepsPerBeat;
+    std::snprintf(t, sizeof(t), "BAR %d.%d / %d", bar + 1, beat + 1, cfg::kLoopBars);
+    set_text(g.bar_text, t);
+}
+
+void update_layers(const ViewModel& m) {
+    int active = 0;
+    for (int i = 0; i < m.s.layer_count; ++i) active += m.s.layers[m.s.order[i]].state == LayerState::Active;
+    char t[32];
+    std::snprintf(t, sizeof(t), "LAYERS %d / %d", active, cfg::kMaxLayers);
+    set_text(g.layers_cap, t);
+    std::snprintf(t, sizeof(t), "CPU %d%%", static_cast<int>(m.cpu * 100.0f + 0.5f));
+    set_text(g.cpu, t);
+
+    for (int r = 0; r < kLayerSlots; ++r) {
+        LayerRow& row = g.rows[r];
+        const bool visible = r < m.s.layer_count;
+        if (visible != row.visible) {
+            row.visible = visible;
+            for (lv_obj_t* o : {row.index.obj, row.name.obj, row.state.obj, row.bar.track, row.bar.fill}) show(o, visible);
+        }
+        if (!visible) {
+            if (row.mark_on) { row.mark_on = false; show(row.mark, false); }
+            continue;
+        }
+        const LayerView& l = m.s.layers[m.s.order[r]];
+        std::snprintf(t, sizeof(t), "%d", r + 1);
+        set_text(row.index, t);
+        set_text(row.name, inst_name(l.instrument));
+        const bool out = l.state == LayerState::FadingOut;
+        if (out) std::snprintf(t, sizeof(t), "FADE OUT %d%%", static_cast<int>(l.gain * 100.0f + 0.5f));
+        else if (l.fade_in < 1.0f) std::snprintf(t, sizeof(t), "FADE IN %d%%", static_cast<int>(l.fade_in * 100.0f));
+        else std::snprintf(t, sizeof(t), "PLAYING  %d", l.notes);
+        set_text(row.state, t);
+        const uint32_t ink = out ? kGrey : kInk;
+        set_color(row.name, ink);
+        set_color(row.state, ink);
+        set_bar(row.bar, out ? l.gain : l.fade_in, out ? kGrey : kInk);
+        if (l.current != row.mark_on) {
+            row.mark_on = l.current;
+            show(row.mark, l.current);
         }
     }
-    if (visible && fill_w != r.fill_w) {
-        r.fill_w = fill_w;
-        lv_obj_set_width(r.fill, fill_w);
-    }
 }
 
-void update_row(RowView& r, const Menu& menu, const ParamStore& params, int index) {
-    char value[24] = "";
-    const char* name = "";
-    bool bar = false;
-    int fill = 0;
-    if (index < menu.row_count()) {
-        const Row row = menu.row(index);
-        switch (row.kind) {
-            case RowKind::Param: {
-                const ParamDef& d = param_def(row.param);
-                const float v = params.get(row.param);
-                name = d.name;
-                param_format(row.param, v, value, sizeof(value));
-                bar = d.curve != Curve::Enum;
-                fill = static_cast<int>(param_normalized(row.param, v) * kBarW + 0.5f);
-                break;
-            }
-            case RowKind::Page:
-                name = row.label;
-                std::snprintf(value, sizeof(value), "%s",
-                              row.target == PageId::Presets ? preset_name(menu.preset()) : ">");
-                break;
-            case RowKind::Preset:
-                name = row.label;
-                std::snprintf(value, sizeof(value), "%s", row.preset == menu.preset() ? "Loaded" : "");
-                break;
+void update_status(const ViewModel& m) {
+    char t[48];
+    const EngineStatus& s = m.s;
+    if (s.seed_notes && s.keys_down) {
+        std::snprintf(t, sizeof(t), "SEED  %d NOTE%s", s.seed_notes, s.seed_notes == 1 ? "" : "S");
+        set_bar(g.seed_bar, 1, kInk);
+    } else if (s.seed_notes) {
+        const float left = s.commit_in < 0 ? 0 : s.commit_in;
+        std::snprintf(t, sizeof(t), "SEED  %d NOTE%s  COMMIT %.1f s", s.seed_notes, s.seed_notes == 1 ? "" : "S",
+                      static_cast<double>(left));
+        set_bar(g.seed_bar, left / cfg::kSeedIdleCommit, kSignal);
+    } else {
+        bool has_layer = false;
+        for (const LayerView& l : s.layers) has_layer = has_layer || (l.current && l.instrument == s.instrument &&
+                                                                      l.state == LayerState::Active);
+        std::snprintf(t, sizeof(t), "%s", has_layer ? "PLAY TO ADD TO LAYER" : "PLAY KEYS TO SEED");
+        set_bar(g.seed_bar, 0, kInk);
+    }
+    set_text(g.seed, t);
+
+    switch (m.mode) {
+        case ButtonLogic::Mode::AOnly:
+            std::snprintf(t, sizeof(t), "HOLD A: SELECT %s", inst_name(m.browse));
+            set_text(g.hold, t);
+            set_bar(g.hold_bar, m.hold, kInk);
+            show(g.hold_tick, false);
+            break;
+        case ButtonLogic::Mode::Chord: {
+            const float layer_at = cfg::kClearLayerHold / cfg::kClearAllHold;
+            bool target = false;  // a layer is marked; otherwise A+B drops the pending seed
+            for (const LayerView& l : s.layers) target = target || (l.current && l.state == LayerState::Active);
+            const char* release = target || !s.seed_notes ? "RELEASE: CLEAR LAYER" : "RELEASE: CLEAR SEED";
+            set_text(g.hold, m.hold < layer_at ? "A+B: HOLD TO CLEAR" : (m.hold < 1 ? release : "CLEAR ALL"));
+            set_bar(g.hold_bar, m.hold, m.hold < layer_at ? kInk : kSignal);
+            show(g.hold_tick, true);
+            break;
         }
+        default:
+            set_text(g.hold, "A/B INSTRUMENT  A+B CLEAR");
+            set_bar(g.hold_bar, 0, kInk);
+            show(g.hold_tick, false);
+            break;
     }
-    set_text(r.name, r.name_text, sizeof(r.name_text), name);
-    set_text(r.value, r.value_text, sizeof(r.value_text), value);
-    set_bar(r, bar, fill);
-    set_selected(r, index == menu.cursor() && index < menu.row_count());
-}
-
-void update_tabs(int group) {
-    if (group == g.shown_group) return;
-    g.shown_group = group;
-    for (int i = 0; i < kGroupCount; ++i) {
-        const bool on = i == group;
-        lv_obj_set_style_bg_color(g.tabs[i], lv_color_hex(on ? kInk : kPaper), 0);
-        lv_obj_set_style_text_color(lv_obj_get_child(g.tabs[i], 0), lv_color_hex(on ? kPaper : kGrey), 0);
-    }
-}
-
-void update_scope(const Engine& engine) {
-    static int16_t samples[kScopeWindow];
-    engine.read_scope(samples, kScopeWindow);
-
-    // A rising zero crossing in the first half keeps periodic waves still.
-    int start = 0;
-    for (int i = 1; i < kScopeWindow - kScopeSamples; ++i) {
-        if (samples[i - 1] < 0 && samples[i] >= 0) { start = i; break; }
-    }
-    constexpr int kMid = kScopeH / 2;
-    constexpr int kStep = kScopeSamples / kScopePoints;
-    bool changed = false;
-    for (int i = 0; i < kScopePoints; ++i) {
-        int y = kMid - (samples[start + i * kStep] * kScopeGain * (kMid - 2)) / 32768;
-        y = y < 1 ? 1 : (y > kScopeH - 2 ? kScopeH - 2 : y);
-        if (g.points[i].y != y) { g.points[i].y = y; changed = true; }
-    }
-    if (changed) lv_obj_invalidate(g.scope);
 }
 
 }  // namespace
@@ -198,54 +268,73 @@ void view_init() {
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(screen, lv_color_hex(kPaper), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    const lv_font_t* small = &lv_font_montserrat_12;
+    const lv_font_t* body = &lv_font_montserrat_14;
+    const lv_font_t* big = &lv_font_montserrat_24;
 
-    constexpr int kTabW = 40;
-    for (int i = 0; i < kGroupCount; ++i) {
-        g.tabs[i] = box(screen, i * kTabW, 0, kTabW, kTabH - 1, kPaper);
-        lv_obj_t* t = label(g.tabs[i], 0, 3, kTabW, &lv_font_montserrat_12, LV_TEXT_ALIGN_CENTER);
-        lv_label_set_text_static(t, group_short_name(i));
-        lv_obj_set_style_text_color(t, lv_color_hex(kGrey), 0);
+    // Head: instrument | BPM | reverb.
+    g.inst_cap = label(screen, kMargin, 5, kBpmX - kMargin - 8, small, LV_TEXT_ALIGN_LEFT, kGrey);
+    g.inst = label(screen, kMargin, 19, kBpmX - kMargin - 8, big, LV_TEXT_ALIGN_LEFT, kInk);
+    Text cap = label(screen, kBpmX, 5, kRevX - kBpmX - 8, small, LV_TEXT_ALIGN_LEFT, kGrey);
+    lv_label_set_text_static(cap.obj, "BPM");
+    g.bpm = label(screen, kBpmX, 19, kRevX - kBpmX - 8, big, LV_TEXT_ALIGN_LEFT, kInk);
+    cap = label(screen, kRevX, 5, kScreenWidth - kMargin - kRevX, small, LV_TEXT_ALIGN_LEFT, kGrey);
+    lv_label_set_text_static(cap.obj, "REVERB");
+    g.rev = label(screen, kRevX, 19, kScreenWidth - kMargin - kRevX, big, LV_TEXT_ALIGN_LEFT, kInk);
+    box(screen, kBpmX - 8, 6, 1, kHeadH - 12, kRule);
+    box(screen, kRevX - 8, 6, 1, kHeadH - 12, kRule);
+    box(screen, 0, kHeadH, kScreenWidth, 1, kInk);
+
+    // Loop: four bars, beat ticks, red playhead.
+    g.loop_cap = label(screen, kMargin, kLoopY + 2, 100, small, LV_TEXT_ALIGN_LEFT, kGrey);
+    lv_label_set_text_static(g.loop_cap.obj, "LOOP");
+    g.bar_text = label(screen, 160, kLoopY + 2, kScreenWidth - kMargin - 160, small, LV_TEXT_ALIGN_RIGHT, kInk);
+    constexpr int kBarW = kContentW / cfg::kLoopBars;
+    for (int b = 0; b < cfg::kLoopBars; ++b) {
+        lv_obj_t* o = box(screen, kMargin + b * kBarW, kLoopBarsY, kBarW - 2, kLoopBarsH, kPaper);
+        lv_obj_set_style_border_width(o, 1, 0);
+        lv_obj_set_style_border_color(o, lv_color_hex(kRule), 0);
+        g.bar_box[b] = o;
+        for (int beat = 1; beat < cfg::kBeatsPerBar; ++beat)
+            box(screen, kMargin + b * kBarW + beat * kBarW / cfg::kBeatsPerBar, kLoopBarsY + kLoopBarsH - 5, 1, 4, kGrey);
     }
-    g.shown_group = -1;
-    g.preset = label(screen, kGroupCount * kTabW, 3, kScreenWidth - kGroupCount * kTabW - 8, &lv_font_montserrat_12,
-                     LV_TEXT_ALIGN_RIGHT);
+    g.shown_bar = -1;
+    g.playhead = box(screen, kMargin, kLoopBarsY - 2, 2, kLoopBarsH + 4, kSignal);
+    g.playhead_x = -1;
+    box(screen, 0, kLayersY - 3, kScreenWidth, 1, kInk);
 
-    box(screen, 0, kScopeY - 1, kScreenWidth, 1, kInk);
-    box(screen, 0, kScopeY + kScopeH / 2, kScreenWidth, 1, kRule);
-    constexpr int kPointStep = kScreenWidth / kScopePoints;
-    for (int i = 0; i < kScopePoints; ++i) {
-        g.points[i].x = i * kPointStep;
-        g.points[i].y = kScopeH / 2;
+    // Layers, oldest first.
+    g.layers_cap = label(screen, kMargin, kLayersY, 200, small, LV_TEXT_ALIGN_LEFT, kGrey);
+    g.cpu = label(screen, 220, kLayersY, kScreenWidth - kMargin - 220, small, LV_TEXT_ALIGN_RIGHT, kGrey);
+    for (int r = 0; r < kLayerSlots; ++r) {
+        LayerRow& row = g.rows[r];
+        const int y = kLayerRowY + r * kLayerRowH;
+        row.index = label(screen, kMargin, y, 12, small, LV_TEXT_ALIGN_LEFT, kGrey);
+        row.mark = box(screen, 22, y + 4, 6, 6, kSignal);
+        row.name = label(screen, 34, y - 1, kLayerStateX - 38, body, LV_TEXT_ALIGN_LEFT, kInk);
+        row.state = label(screen, kLayerStateX, y, kLayerBarX - kLayerStateX - 6, small, LV_TEXT_ALIGN_LEFT, kInk);
+        row.bar = bar(screen, kLayerBarX, y + 4, kLayerBarW);
+        show(row.mark, false);
+        row.visible = true;
+        row.mark_on = false;
     }
-    g.scope = lv_line_create(screen);
-    lv_obj_set_pos(g.scope, 0, kScopeY);
-    lv_obj_set_size(g.scope, kScreenWidth, kScopeH);
-    lv_line_set_points_mutable(g.scope, g.points, kScopePoints);
-    lv_obj_set_style_line_color(g.scope, lv_color_hex(kInk), 0);
-    lv_obj_set_style_line_width(g.scope, 1, 0);
-    box(screen, 0, kRowsY - 1, kScreenWidth, 1, kInk);
+    box(screen, 0, kStatusY - 2, kScreenWidth, 1, kInk);
 
-    build_rows(screen);
-
-    box(screen, 0, kStatusY - 1, kScreenWidth, 1, kInk);
-    g.title = label(screen, kNameX, kStatusY + 3, 130, &lv_font_montserrat_12, LV_TEXT_ALIGN_LEFT);
-    g.status = label(screen, 130, kStatusY + 3, kScreenWidth - 130 - 8, &lv_font_montserrat_12, LV_TEXT_ALIGN_RIGHT);
+    // Status: seed state with countdown, A/B hold progress with the clear-layer mark.
+    g.seed = label(screen, kMargin, kStatusY + 2, kHoldBarX - kMargin - 6, small, LV_TEXT_ALIGN_LEFT, kInk);
+    g.seed_bar = bar(screen, kHoldBarX, kStatusY + 6, kHoldBarW);
+    g.hold = label(screen, kMargin, kStatusY + 20, kHoldBarX - kMargin - 6, small, LV_TEXT_ALIGN_LEFT, kInk);
+    g.hold_bar = bar(screen, kHoldBarX, kStatusY + 24, kHoldBarW);
+    g.hold_tick = box(screen, kHoldBarX + static_cast<int>(kHoldBarW * cfg::kClearLayerHold / cfg::kClearAllHold),
+                      kStatusY + 20, 1, 13, kInk);
+    show(g.hold_tick, false);
 }
 
-void view_update(const Menu& menu, const ParamStore& params, const Engine& engine, float cpu_load) {
-    update_tabs(menu.group());
-    for (int i = 0; i < kVisibleRows; ++i) update_row(g.rows[i], menu, params, menu.top() + i);
-    update_scope(engine);
-
-    set_text(g.preset, g.preset_text, sizeof(g.preset_text), preset_name(menu.preset()));
-    set_text(g.title, g.title_text, sizeof(g.title_text), menu.title());
-
-    int voices = 0;
-    for (uint8_t m = engine.voice_mask(); m; m = static_cast<uint8_t>(m & (m - 1))) ++voices;
-    char status[48];
-    std::snprintf(status, sizeof(status), "Oct %+d   Voices %d/%d   CPU %d %%", params.get_int(ParamId::GlbOctave),
-                  voices, kVoices, static_cast<int>(cpu_load * 100.0f + 0.5f));
-    set_text(g.status, g.status_text, sizeof(g.status_text), status);
+void view_update(const ViewModel& m) {
+    update_head(m);
+    update_loop(m);
+    update_layers(m);
+    update_status(m);
 }
 
 }  // namespace danger

@@ -6,7 +6,8 @@ set(INCLUDES . "${REPO}" "${REPO}/core/ui")
 # Component scripts also run once in script mode, where the project's variables do not exist.
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
   file(GLOB CORE_SOURCES
-    "${REPO}/core/*.cpp" "${REPO}/core/synth/*.cpp" "${REPO}/core/ui/*.cpp" "${REPO}/core/mirror/*.cpp"
+    "${REPO}/core/*.cpp" "${REPO}/core/audio/*.cpp" "${REPO}/core/beat/*.cpp" "${REPO}/core/samples/*.cpp"
+    "${REPO}/core/ui/*.cpp" "${REPO}/core/mirror/*.cpp"
     "${REPO}/hal/esp32/*.cpp")
   file(GLOB_RECURSE LVGL_SOURCES "${DANGER_LVGL_DIR}/src/*.c")
   # PlatformIO flattens object names for external sources, and these trees repeat file names.
